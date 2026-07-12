@@ -319,9 +319,17 @@ static void onPdmData() {                     /* interrupt context: copy only */
   micSamples = bytes / 2;
 }
 
-static void toneStart() {
+/* One full sine cycle sampled at 64 points -- the shape never depends on
+ * toneFreq (that's set via the DAC's sample clock below), so it's built
+ * once here rather than recomputed with 64 sinf() calls on every tone-on
+ * and every frequency-slider drag tick (toneFreqCb re-begins the tone at
+ * each new frequency, which used to mean re-running this loop mid-drag). */
+static void initSineLut() {
   for (int i = 0; i < 64; i++)
     sineLut[i] = 2048 + (int)(2000.0f * sinf(i * 6.2831853f / 64.0f));
+}
+
+static void toneStart() {
   if (dac0.begin(AN_RESOLUTION_12, (uint32_t)toneFreq * 64, 64, 32)) toneOn = true;
 }
 
@@ -704,6 +712,13 @@ static void blePoll() {
 
 /* ================= periodic UI timers ================= */
 
+/* Cached so statusTimerCb's BLE stream (a separate, slower timer) reads the
+ * same sample the UI just showed instead of taking its own independent
+ * analogRead() -- one fewer ADC conversion per tick, and the value a BLE
+ * central sees now always matches what's on screen instead of occasionally
+ * differing by whatever changed between two split-second-apart reads. */
+static int lastA0 = 0;
+
 static void sensorTimerCb(lv_timer_t *t) {
   (void)t;
   for (int i = 0; i < 4; i++) {
@@ -712,6 +727,7 @@ static void sensorTimerCb(lv_timer_t *t) {
     lv_label_set_text_fmt(sensorLbl[i], "%s   %4d   %d.%02d V",
         ANALOG_NAME[i], v, (v * 33) / 10230, ((v * 330) / 1023) % 100);
     if (i == 0) {
+      lastA0 = v;
       lv_chart_set_next_value(chart, chartSer, v);
       int pct = (v * 100) / 1023;
       lv_arc_set_value(gaugeArc, pct);
@@ -762,53 +778,81 @@ static void statusTimerCb(lv_timer_t *t) {
     Serial.print(" big "); Serial.print(m.free_biggest_size);
     Serial.print(" frag "); Serial.println(m.frag_pct);
   }
-  /* dashboard: wifi */
-  if (WiFi.status() == WL_CONNECTED) {
-    IPAddress ip = WiFi.localIP();
-    lv_label_set_text_fmt(dashWifiLbl, "%s\n%u.%u.%u.%u  (%ld dBm)",
-        WiFi.SSID(), ip[0], ip[1], ip[2], ip[3], (long)WiFi.RSSI());
-    lv_obj_set_style_text_color(dashWifiLbl, lv_color_hex(C_OK), 0);
-  } else {
-    lv_label_set_text(dashWifiLbl, "Offline\nuse the WiFi tab");
-    lv_obj_set_style_text_color(dashWifiLbl, lv_color_hex(C_MUTED), 0);
+
+  /* Every label below belongs to exactly one tab -- same "don't update
+   * widgets nobody can see" principle already applied to imuTimerCb/
+   * audioTimerCb. Each block is skipped unless its own tab is active; the
+   * timer still fires every second regardless, so a tab picks back up
+   * within at most 1s of switching to it -- no real staleness, just no
+   * wasted formatting/style work while off-tab. The BLE characteristic
+   * stream at the end is the one exception: a phone can be subscribed
+   * regardless of which tab is on screen, so it always runs. */
+  uint32_t activeTab = lv_tabview_get_tab_active(tabview);
+
+  if (activeTab == 0) {                            /* dashboard: wifi */
+    if (WiFi.status() == WL_CONNECTED) {
+      IPAddress ip = WiFi.localIP();
+      lv_label_set_text_fmt(dashWifiLbl, "%s\n%u.%u.%u.%u  (%ld dBm)",
+          WiFi.SSID(), ip[0], ip[1], ip[2], ip[3], (long)WiFi.RSSI());
+      lv_obj_set_style_text_color(dashWifiLbl, lv_color_hex(C_OK), 0);
+    } else {
+      lv_label_set_text(dashWifiLbl, "Offline\nuse the WiFi tab");
+      lv_obj_set_style_text_color(dashWifiLbl, lv_color_hex(C_MUTED), 0);
+    }
   }
+
   /* WiFi tab: catch connection drops (weak signal, router reboot, ...)
    * while the user is just sitting on the tab -- otherwise the label only
    * updates on an explicit scan/connect/disconnect action and can go
    * stale. Skipped while a scan/connect/portal-check/modal-close is in
    * flight so this doesn't clobber a transient "Scanning..." message. */
-  if (!scanPending && !connectPending && !portalCheckPending && !kbClosePending)
+  if (activeTab == 6 && !scanPending && !connectPending && !portalCheckPending && !kbClosePending)
     updateWifiStatus();
-  /* dashboard + tab: BLE */
-  const char *bleTxt; uint32_t bleCol;
-  if (!bleEnabled)                { bleTxt = "Disabled";                 bleCol = C_MUTED; }
-  else if (BLE.central())         { bleTxt = "Central connected";        bleCol = C_OK;    }
-  else                            { bleTxt = "Advertising as\n" BLE_DEVICE_NAME; bleCol = C_ACCENT; }
-  lv_label_set_text(dashBleLbl, bleTxt);
-  lv_obj_set_style_text_color(dashBleLbl, lv_color_hex(bleCol), 0);
-  lv_label_set_text_fmt(bleStatusLbl, LV_SYMBOL_BLUETOOTH "  %s", bleTxt);
-  lv_obj_set_style_text_color(bleStatusLbl, lv_color_hex(bleCol), 0);
-  /* uptime */
-  uint32_t s = millis() / 1000;
-  lv_label_set_text_fmt(dashUpLbl, "Uptime  %luh %02lum %02lus",
-      (unsigned long)(s / 3600), (unsigned long)((s / 60) % 60), (unsigned long)(s % 60));
-  /* settings: system info */
-  IPAddress ip = WiFi.localIP();
-  lv_label_set_text_fmt(sysInfoLbl,
-      "Uptime      %luh %02lum %02lus\n"
-      "WiFi        %s\n"
-      "IP          %u.%u.%u.%u\n"
-      "IMU         %s\n"
-      "Microphone  %s\n"
-      "LVGL        %d.%d.%d",
-      (unsigned long)(s / 3600), (unsigned long)((s / 60) % 60), (unsigned long)(s % 60),
-      WiFi.status() == WL_CONNECTED ? WiFi.SSID() : "offline",
-      ip[0], ip[1], ip[2], ip[3],
-      imuOk ? "OK (BMI270)" : "not found",
-      micOk ? "OK (PDM)" : "not found",
-      LVGL_VERSION_MAJOR, LVGL_VERSION_MINOR, LVGL_VERSION_PATCH);
-  /* stream A0 to a subscribed BLE central */
-  if (bleEnabled && BLE.central()) sensorChar.writeValue((uint16_t)analogRead(ANALOG_PIN[0]));
+
+  if (activeTab == 0 || activeTab == 7) {          /* dashboard + BLE tab */
+    const char *bleTxt; uint32_t bleCol;
+    if (!bleEnabled)                { bleTxt = "Disabled";                 bleCol = C_MUTED; }
+    else if (BLE.central())         { bleTxt = "Central connected";        bleCol = C_OK;    }
+    else                            { bleTxt = "Advertising as\n" BLE_DEVICE_NAME; bleCol = C_ACCENT; }
+    if (activeTab == 0) {
+      lv_label_set_text(dashBleLbl, bleTxt);
+      lv_obj_set_style_text_color(dashBleLbl, lv_color_hex(bleCol), 0);
+    }
+    if (activeTab == 7) {
+      lv_label_set_text_fmt(bleStatusLbl, LV_SYMBOL_BLUETOOTH "  %s", bleTxt);
+      lv_obj_set_style_text_color(bleStatusLbl, lv_color_hex(bleCol), 0);
+    }
+  }
+
+  if (activeTab == 0) {                            /* uptime */
+    uint32_t s = millis() / 1000;
+    lv_label_set_text_fmt(dashUpLbl, "Uptime  %luh %02lum %02lus",
+        (unsigned long)(s / 3600), (unsigned long)((s / 60) % 60), (unsigned long)(s % 60));
+  }
+
+  if (activeTab == 8) {                            /* settings: system info */
+    uint32_t s = millis() / 1000;
+    IPAddress ip = WiFi.localIP();
+    lv_label_set_text_fmt(sysInfoLbl,
+        "Uptime      %luh %02lum %02lus\n"
+        "WiFi        %s\n"
+        "IP          %u.%u.%u.%u\n"
+        "IMU         %s\n"
+        "Microphone  %s\n"
+        "LVGL        %d.%d.%d",
+        (unsigned long)(s / 3600), (unsigned long)((s / 60) % 60), (unsigned long)(s % 60),
+        WiFi.status() == WL_CONNECTED ? WiFi.SSID() : "offline",
+        ip[0], ip[1], ip[2], ip[3],
+        imuOk ? "OK (BMI270)" : "not found",
+        micOk ? "OK (PDM)" : "not found",
+        LVGL_VERSION_MAJOR, LVGL_VERSION_MINOR, LVGL_VERSION_PATCH);
+  }
+
+  /* stream A0 to a subscribed BLE central -- reuse sensorTimerCb's sample
+   * rather than taking a fresh independent reading (see lastA0 comment).
+   * Always runs regardless of active tab -- a phone can be subscribed no
+   * matter what's on screen. */
+  if (bleEnabled && BLE.central()) sensorChar.writeValue((uint16_t)lastA0);
 }
 
 /* ================= theme / styles ================= */
@@ -1293,6 +1337,7 @@ void setup() {
   PDM.onReceive(onPdmData);
   micOk = PDM.begin(1, 16000) != 0;
 #endif
+  initSineLut();
 
   initTheme();
 
