@@ -16,6 +16,7 @@ Shield** + **Arduino 4 Relays Shield**, built with LVGL 9.
 | **WiFi** | Scan networks, tap one, type the password on the on-screen keyboard, connect / disconnect; open networks connect directly. "Other network…" lets you type a hidden/out-of-range SSID by hand. After connecting, automatically checks for a captive portal (sign-in page) and flags it if found; shows a specific error if the connect attempt fails |
 | **BLE** | Toggle a BLE peripheral (`GIGA-Control`) that lets a phone control relays & motors and stream A0 |
 | **Settings** | Display brightness, sensor update rate, system info, safety notes |
+| **Recon** | TCP connect-scan of a user-entered target IP across 8 common ports. **For authorized security testing only** — see the Recon section below |
 
 ## Pin map
 
@@ -53,21 +54,26 @@ cable or double-tap its RESET button, then upload again.
 ## Serial debug commands (115200 baud)
 
 The sketch accepts single-character commands for remote testing:
-`1`–`9` switch tabs, `s` run a WiFi scan directly, `w`/`h` jump to WiFi/Home,
-`t` synthesize a tap on the Scan button, `n` synthesize a tap on the first
-scanned network button, `p`/`c` open/close the password modal directly
-(with a dummy SSID), `r` simulate tapping the keyboard's checkmark
-(`LV_EVENT_READY`) with a dummy password — exercises the real
-connect-and-close path without needing a physical touch, which is how the
-`kbCb` freeze (see Caveats) was actually reproduced and fixed. `g` runs
-the captive-portal connectivity check directly (useful to test it without
-needing an actual captive-portal network). `o`/`y` open the manual-SSID
-modal and submit a dummy hidden SSID (chains into the password modal, same
-as tapping "Other network…" for real). `b` toggles BLE, same as tapping its
-switch. `x` deliberately hangs forever with no watchdog kicks — used to
-verify the watchdog actually resets the board (see Caveats); don't send it
-unless you mean it, the board will reboot a few seconds later. A
-timestamped `hb` heartbeat prints once a second while a monitor is
+`1`–`9` switch tabs, `0` jumps to tab 9 (Recon, appended after the `1`-`9`
+range so it doesn't renumber any existing tab), `s` run a WiFi scan
+directly, `w`/`h` jump to WiFi/Home, `t` synthesize a tap on the Scan
+button, `n` synthesize a tap on the first scanned network button, `p`/`c`
+open/close the password modal directly (with a dummy SSID), `r` simulate
+tapping the keyboard's checkmark (`LV_EVENT_READY`) with a dummy password —
+exercises the real connect-and-close path without needing a physical
+touch, which is how the `kbCb` freeze (see Caveats) was actually
+reproduced and fixed. `g` runs the captive-portal connectivity check
+directly (useful to test it without needing an actual captive-portal
+network). `o`/`y` open the manual-SSID modal and submit a dummy hidden
+SSID (chains into the password modal, same as tapping "Other network…"
+for real). `b` toggles BLE, same as tapping its switch. `i`/`k` open the
+Recon target-IP modal and submit a dummy target (RFC 5737 `192.0.2.1`,
+guaranteed non-routable — safe for automated testing, though note this is
+also the *slowest* case for a scan, see the Recon section for why). `x`
+deliberately hangs forever with no watchdog kicks — used to verify the
+watchdog actually resets the board (see Caveats); don't send it unless you
+mean it, the board will reboot a few seconds later. A timestamped `hb`
+heartbeat prints once a second while a monitor is
 attached, including live LVGL heap stats (`free`/`big`/`frag`) — useful for
 catching memory issues before they cause a freeze.
 
@@ -88,6 +94,16 @@ The WiFi tab's status line distinguishes:
 **Hidden/manual SSID entry**: tap "Other network…" on the WiFi tab to type a network name by hand (for hidden or out-of-range networks not in the scan list). Submitting it opens the normal password keyboard for that SSID — leave the password blank and submit for an open network. Built with the same create-fresh, defer-close-out-of-the-callback pattern as the password modal (see Caveats) to avoid the same class of freeze.
 
 **Known gap, not implemented, and not planned**: no WPA2-Enterprise (802.1X username+password, the kind schools/corporate offices use) support. Checked the installed WiFi library headers directly — only `begin(ssid)` and `begin(ssid, passphrase, security)` exist, no EAP/802.1X anywhere. Supporting it would mean dropping below the Arduino WiFi library to raw mbed network APIs, too large an effort for what's fundamentally a home-network control panel.
+
+## Recon tab — for authorized security testing only
+
+**Only scan hosts and networks you have explicit permission to test.** This is a standard TCP port scanner, the same category of tool as `nmap`, and carries the same expectation of authorized use.
+
+Tap "Set target & scan", type an IP address, submit — it TCP connect-scans 8 common ports (FTP 21, SSH 22, Telnet 23, HTTP 80, HTTPS 443, SMB 445, RDP 3389, HTTP-alt 8080) and lists each as open/closed. Results also print to serial (`recon: port <N> open/closed`) for an audit trail.
+
+**What this device's WiFi hardware genuinely cannot do**: monitor mode, raw 802.11 frame access, packet injection. Checked `WiFi.h`/`WiFi.cpp` directly — the library only exposes station/AP mode via `WiFiClient`. This isn't a missing feature to add later; the Murata WiFi module + Arduino WiFi library don't expose that layer at all. (For that class of testing, jessy's onboard `ath10k_snoc` adapter *does* support monitor mode per `iw list` — see the security-toolkit notes on that device instead.)
+
+**Known limitation, found during testing, not just assumed**: `WiFiClient::setSocketTimeout()` does **not** bound the `connect()` phase on this core — confirmed by reading `MbedClient.cpp`: the timeout is only ever applied for the SSL variant and for I/O *after* a successful connect, never before a plain `connect()`. Scanning a **live, responsive** host is fast (proven against a real host on the local network: 8 ports in ~0.12s). Scanning an **unresponsive/offline** host is slow — each port's `connect()` falls back to the underlying mbed network stack's own default timeout, observed to take tens of seconds *total* across 8 ports rather than the sub-second the code originally assumed, and the whole UI is unresponsive for that entire duration (the scan runs synchronously in `loop()`, blocking `lv_timer_handler()` along with everything else). It always eventually completes on its own — confirmed by letting one run to completion rather than assuming — no crash, no permanent hang. The hardware watchdog is deliberately paused for the duration of a scan specifically because of this (a slow scan against an unresponsive host isn't the kind of hang the watchdog should "fix" by rebooting mid-scan) and resumed immediately after. If this becomes an actual annoyance, the real fix is a non-blocking `TCPSocket` + manual poll loop instead of `WiFiClient::connect()`, not a different timeout call.
 
 ## BLE protocol (service `19B10000-E8F2-537E-4F6C-D104768A1214`)
 
@@ -116,6 +132,28 @@ Test with **nRF Connect** or **LightBlue** on your phone.
   modal is rebuilt fresh on each open/close rather than kept permanently
   resident (a resident keyboard widget left only ~4.8KB free indefinitely —
   too thin a margin for hours of continuous dashboard/IMU/audio timer churn).
+- **A "list of items" widget list costs more LVGL pool space than it looks
+  like it should.** The Recon results list originally scanned 16 ports;
+  populating 16 result rows (same `lv_obj` + `lv_label` + per-item
+  `lv_obj_set_style_*` pattern as the WiFi scan list) against a real host
+  drove the LVGL heap down to **280 bytes free** — a near-OOM condition,
+  confirmed by actually running the scan rather than assuming it was fine
+  because it compiled. Cut to 8 ports (matching the WiFi scan list's
+  already-proven-stable cap) and it settled at a stable ~4.3KB free
+  instead. If you're tempted to make a results list longer than 8 items
+  anywhere in this file, verify the actual heap headroom with the `hb`
+  telemetry rather than assuming it'll be fine.
+- **`WiFiClient::setSocketTimeout()` does not bound `connect()` on this
+  core.** Found while testing the Recon scan, not assumed: reading
+  `MbedClient.cpp` shows `connect(IPAddress, port)` calls `sock->connect()`
+  directly on a freshly created `TCPSocket` — `set_timeout()` is only ever
+  wired up for the SSL connect variant and for I/O *after* a successful
+  plain connect, never before one. A scan against an unresponsive host can
+  therefore block far longer than the timeout value passed to
+  `setSocketTimeout()` would suggest (confirmed: tripped the watchdog
+  during testing before this was understood). See the Recon section above
+  for the actual fix (the watchdog is deliberately paused for the
+  duration of a scan) and the real numbers observed.
 - **Closing the password modal must NOT happen synchronously from inside
   the keyboard's own event callback.** `kbCb` fires `LV_EVENT_READY` when
   the user taps the keyboard's checkmark. An earlier version of this code

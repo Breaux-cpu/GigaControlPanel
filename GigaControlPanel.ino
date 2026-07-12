@@ -75,6 +75,9 @@ static const char   *ANALOG_NAME[4] = { "A0", "A1", "A2", "A3" };
  * first), so each of those gets an explicit kick on either side of the
  * call on top of the per-loop() kick. */
 static void wdKick() { mbed::Watchdog::get_instance().kick(); }
+static uint32_t wdTimeout = 20000;   /* set for real in setup(); global so it can be
+                                      * reused when performReconScan() pauses/resumes
+                                      * the watchdog around its long connect() calls */
 
 /* ---- persistent settings (flash-backed, survive reboot & re-upload) ---- */
 #define EN_KV 1      /* persistent settings across reboots (WiFi creds, BLE, brightness, rate) */
@@ -167,6 +170,9 @@ static lv_obj_t *wifiStatusLbl, *wifiList, *scanBtn;
 static lv_obj_t *bleStatusLbl, *bleSw;
 static lv_obj_t *pwModal = NULL, *pwTa, *pwTitle, *pwKb;
 static lv_obj_t *ssidModal = NULL, *ssidTa, *ssidKb;
+static lv_obj_t *reconModal = NULL, *reconTa, *reconKb;
+static lv_obj_t *reconList, *reconStatusLbl;
+static char     targetIp[40] = "";
 static lv_obj_t *accBar[3], *gyroBar[3], *accLbl, *gyroLbl, *imuStatusLbl;
 static lv_obj_t *micBar, *micLbl, *micChart, *toneFreqLbl;
 static lv_chart_series_t *micSer;
@@ -584,6 +590,147 @@ static void openSsidModal() {
 }
 
 static void otherNetworkCb(lv_event_t *e) { (void)e; openSsidModal(); }
+
+/* ---------------- Recon (network reconnaissance / port scan) ----------------
+ * For authorized security testing only -- only scan hosts/networks covered
+ * by an actual engagement's written authorization.
+ *
+ * TCP connect-scan against a user-entered target IP across a small fixed
+ * list of common ports. The GIGA's WiFi library (WiFi.h/WiFi.cpp, read
+ * earlier) only exposes station/AP mode via WiFiClient -- no monitor mode,
+ * no raw 802.11 frame access -- so this is deliberately scoped to what a
+ * TCP/IP client stack can actually do, not a general pentest suite.
+ *
+ * Capped at 8 ports (was 16): a real scan against a live host pushed the
+ * LVGL heap down to 280 bytes free -- each result row costs real pool
+ * space, and 16 of them is roughly double what the WiFi scan list (also
+ * capped at 8, and proven stable all session) uses. 8 keeps this at the
+ * same, already-validated memory footprint. */
+static const uint16_t COMMON_PORTS[] = { 21, 22, 23, 80, 443, 445, 3389, 8080 };
+#define NUM_COMMON_PORTS (sizeof(COMMON_PORTS) / sizeof(COMMON_PORTS[0]))
+
+/* Same create-fresh, defer-close-out-of-the-callback pattern as the
+ * password/SSID modals: reconKbCb only captures the typed IP and arms a
+ * countdown; loop() closes the modal and starts the scan a few frames
+ * later, never touching anything from inside the keyboard's own event
+ * dispatch (see kbCb's comment for why that reproducibly hard-froze the
+ * board earlier this session). */
+static volatile uint8_t reconClosePending = 0;
+static volatile bool    reconSubmitted = false;
+
+static void closeReconModal() {
+  if (reconModal) { lv_obj_delete(reconModal); reconModal = NULL; }
+  lv_obj_set_style_bg_opa(lv_layer_top(), LV_OPA_TRANSP, 0);
+  lv_obj_remove_flag(lv_layer_top(), LV_OBJ_FLAG_CLICKABLE);
+}
+
+static void reconKbCb(lv_event_t *e) {
+  lv_event_code_t code = lv_event_get_code(e);
+  if (code == LV_EVENT_READY) {
+    strlcpy(targetIp, lv_textarea_get_text(reconTa), sizeof(targetIp));
+    reconSubmitted = true;
+    reconClosePending = 5;
+  } else if (code == LV_EVENT_CANCEL) {
+    reconSubmitted = false;
+    reconClosePending = 5;
+  }
+}
+
+static void openReconModal() {
+  lv_obj_set_style_bg_color(lv_layer_top(), lv_color_hex(0x000000), 0);
+  lv_obj_set_style_bg_opa(lv_layer_top(), LV_OPA_50, 0);
+  lv_obj_add_flag(lv_layer_top(), LV_OBJ_FLAG_CLICKABLE);
+
+  reconModal = lv_obj_create(lv_layer_top());
+  lv_obj_set_size(reconModal, 560, 380);
+  lv_obj_center(reconModal);
+  lv_obj_add_style(reconModal, &stCard, 0);
+  lv_obj_remove_flag(reconModal, LV_OBJ_FLAG_SCROLLABLE);
+
+  lv_obj_t *title = lv_label_create(reconModal);
+  lv_label_set_text(title, LV_SYMBOL_GPS "  Enter target IP address");
+  lv_obj_add_style(title, &stCardTitle, 0);
+  lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 0);
+
+  reconTa = lv_textarea_create(reconModal);
+  lv_textarea_set_one_line(reconTa, true);
+  lv_textarea_set_placeholder_text(reconTa, "192.168.1.1");
+  lv_obj_set_width(reconTa, 400);
+  lv_obj_align(reconTa, LV_ALIGN_TOP_MID, 0, 40);
+
+  reconKb = lv_keyboard_create(reconModal);
+  lv_obj_set_size(reconKb, 520, 230);
+  lv_obj_align(reconKb, LV_ALIGN_BOTTOM_MID, 0, 0);
+  lv_keyboard_set_textarea(reconKb, reconTa);
+  lv_obj_add_event_cb(reconKb, reconKbCb, LV_EVENT_ALL, NULL);
+  DBG("recon modal: open");
+}
+
+static void openReconModalCb(lv_event_t *e) { (void)e; openReconModal(); }
+
+/* Blocking (WiFiClient::connect() per port) -- must run from loop(), never
+ * an LVGL callback, same rule as every other network call in this file.
+ *
+ * setSocketTimeout() does NOT bound the connect() phase on this core:
+ * reading MbedClient.cpp shows connect(IPAddress, port) creates a raw
+ * TCPSocket and calls sock->connect() directly -- sock->set_timeout()
+ * is only ever invoked for the SSL variant and for I/O *after* a
+ * successful connect. So a filtered/non-responding port's connect() call
+ * blocks for whatever the underlying mbed network stack's own default is,
+ * not the 400ms this code originally assumed -- confirmed the hard way:
+ * the watchdog fired mid-scan during testing. Rather than reach for a raw
+ * non-blocking-socket rewrite, the watchdog is deliberately paused for
+ * this one bounded, user-initiated operation (TCP connect attempts always
+ * eventually give up on their own; this just isn't a hang the watchdog
+ * needs to catch) and resumed immediately after. */
+static void performReconScan() {
+  DBG("recon: scan begin");
+  mbed::Watchdog &watchdog = mbed::Watchdog::get_instance();
+  watchdog.stop();
+
+  if (reconList) lv_obj_clean(reconList);
+  lv_label_set_text_fmt(reconStatusLbl, LV_SYMBOL_REFRESH "  Scanning %s ...", targetIp);
+  lv_obj_set_style_text_color(reconStatusLbl, lv_color_hex(C_WARN), 0);
+
+  IPAddress target;
+  if (!target.fromString(targetIp)) {
+    lv_label_set_text_fmt(reconStatusLbl, LV_SYMBOL_CLOSE "  Invalid IP: %s", targetIp);
+    lv_obj_set_style_text_color(reconStatusLbl, lv_color_hex(C_DANGER), 0);
+    DBG("recon: invalid target");
+    watchdog.start(wdTimeout);
+    return;
+  }
+
+  int openCount = 0;
+  for (size_t i = 0; reconList && i < NUM_COMMON_PORTS; i++) {
+    WiFiClient client;
+    bool open = client.connect(target, COMMON_PORTS[i]);
+    if (open) { client.stop(); openCount++; }
+    if (Serial) {   /* audit-trail log, not just a debug aid, for a security tool */
+      Serial.print("recon: port "); Serial.print(COMMON_PORTS[i]);
+      Serial.println(open ? " open" : " closed");
+    }
+
+    lv_obj_t *row = lv_obj_create(reconList);
+    lv_obj_set_width(row, LV_PCT(100));
+    lv_obj_set_height(row, 40);
+    lv_obj_set_style_bg_color(row, lv_color_hex(open ? 0x14301F : 0x1B2A4A), 0);
+    lv_obj_set_style_radius(row, 8, 0);
+    lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t *lbl = lv_label_create(row);
+    lv_label_set_text_fmt(lbl, "%s   port %-5u  %s",
+        open ? LV_SYMBOL_OK : LV_SYMBOL_CLOSE, COMMON_PORTS[i], open ? "open" : "closed");
+    lv_obj_set_style_text_color(lbl, lv_color_hex(open ? C_OK : C_MUTED), 0);
+    lv_obj_align(lbl, LV_ALIGN_LEFT_MID, 8, 0);
+  }
+
+  watchdog.start(wdTimeout);
+  wdKick();
+  lv_label_set_text_fmt(reconStatusLbl, LV_SYMBOL_OK "  Scan of %s complete -- %d/%d ports open",
+      targetIp, openCount, (int)NUM_COMMON_PORTS);
+  lv_obj_set_style_text_color(reconStatusLbl, lv_color_hex(C_TEXT), 0);
+  DBG("recon: scan end");
+}
 
 static void wifiItemCb(lv_event_t *e) {
   int i = (int)(uintptr_t)lv_event_get_user_data(e);
@@ -1301,15 +1448,55 @@ static void buildSettings(lv_obj_t *tab) {
   lv_obj_center(bt);
 }
 
+static void buildRecon(lv_obj_t *tab) {
+  lv_obj_t *c = makeCard(tab, 642, 96);
+  cardTitle(c, LV_SYMBOL_GPS, "Network reconnaissance (TCP port scan)");
+  reconStatusLbl = lv_label_create(c);
+  lv_obj_set_width(reconStatusLbl, 460);
+  lv_label_set_long_mode(reconStatusLbl, LV_LABEL_LONG_MODE_WRAP);
+  lv_obj_align(reconStatusLbl, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+  lv_label_set_text(reconStatusLbl, "Enter a target IP to scan common ports");
+  lv_obj_add_style(reconStatusLbl, &stMuted, 0);
+
+  lv_obj_t *scanBtn2 = lv_button_create(c);
+  lv_obj_set_size(scanBtn2, 190, 40);
+  lv_obj_align(scanBtn2, LV_ALIGN_RIGHT_MID, 0, 6);
+  lv_obj_set_style_bg_color(scanBtn2, lv_color_hex(C_ACCENT), 0);
+  lv_obj_add_event_cb(scanBtn2, openReconModalCb, LV_EVENT_CLICKED, NULL);
+  lv_obj_t *sl = lv_label_create(scanBtn2);
+  lv_label_set_text(sl, LV_SYMBOL_GPS " Set target & scan");
+  lv_obj_center(sl);
+
+  /* Same plain flex-column + lv_button pattern as wifiList -- never
+   * lv_list, confirmed multiple times this session to hard-freeze this
+   * LVGL/display-driver combination. */
+  reconList = lv_obj_create(tab);
+  lv_obj_set_size(reconList, 642, 260);
+  lv_obj_set_style_bg_color(reconList, lv_color_hex(C_CARD), 0);
+  lv_obj_set_style_border_color(reconList, lv_color_hex(C_CARD_BRD), 0);
+  lv_obj_set_style_radius(reconList, 16, 0);
+  lv_obj_set_flex_flow(reconList, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_style_pad_row(reconList, 6, 0);
+
+  lv_obj_t *note = lv_label_create(tab);
+  lv_label_set_text(note,
+    "TCP connect-scan across common ports (FTP/SSH/Telnet/HTTP/HTTPS/SMB/RDP/\n"
+    "HTTP-alt). For authorized security testing only -- only scan hosts/networks\n"
+    "you have explicit permission to test.");
+  lv_obj_add_style(note, &stMuted, 0);
+}
+
 /* ================= setup / loop ================= */
 
 void setup() {
   Serial.begin(115200);
 
-  /* watchdog first, before anything that could hang -- see wdKick() comment */
+  /* watchdog first, before anything that could hang -- see wdKick() comment.
+   * wdTimeout is global (not a setup()-local) so performReconScan() can
+   * restart the watchdog with the same value after deliberately pausing it. */
   mbed::Watchdog &watchdog = mbed::Watchdog::get_instance();
   uint32_t wdMax = watchdog.get_max_timeout();
-  uint32_t wdTimeout = wdMax < 20000 ? wdMax : 20000;
+  wdTimeout = wdMax < 20000 ? wdMax : 20000;
   watchdog.start(wdTimeout);
   if (Serial) {
     Serial.print("watchdog: started timeout="); Serial.print(wdTimeout);
@@ -1357,8 +1544,14 @@ void setup() {
   lv_obj_t *tWifi = lv_tabview_add_tab(tabview, LV_SYMBOL_WIFI);
   lv_obj_t *tBle  = lv_tabview_add_tab(tabview, LV_SYMBOL_BLUETOOTH);
   lv_obj_t *tSet  = lv_tabview_add_tab(tabview, LV_SYMBOL_SETTINGS);
+  /* Recon appended last (index 9) rather than inserted earlier, so every
+   * existing tab index (used throughout statusTimerCb/imuTimerCb/
+   * audioTimerCb's tab-gating and the serial commands below) stays exactly
+   * as it was -- no risk of an off-by-one from renumbering. */
+  lv_obj_t *tRecon = lv_tabview_add_tab(tabview, LV_SYMBOL_GPS);
   styleTab(tDash); styleTab(tRel); styleTab(tMot); styleTab(tSen);
   styleTab(tImu);  styleTab(tAud); styleTab(tWifi); styleTab(tBle); styleTab(tSet);
+  styleTab(tRecon);
 
   /* style the tab bar buttons (v9: real buttons inside the bar) */
   lv_obj_t *tb = lv_tabview_get_tab_bar(tabview);
@@ -1384,6 +1577,7 @@ void setup() {
   buildWifi(tWifi);
   buildBluetooth(tBle);
   buildSettings(tSet);
+  buildRecon(tRecon);
 
   updateWifiStatus();
   static const uint16_t rates[] = { 100, 300, 1000 };
@@ -1430,6 +1624,10 @@ void loop() {
       lv_tabview_set_active(tabview, cmd - '1', LV_ANIM_OFF);
       if (Serial) { Serial.print("tab set "); Serial.println(cmd - '1'); }
     }
+    else if (cmd == '0') {              /* tab 9 = Recon, appended after the '1'-'9' range */
+      lv_tabview_set_active(tabview, 9, LV_ANIM_OFF);
+      if (Serial) { Serial.print("tab set "); Serial.println(9); }
+    }
     /* password-modal test: p=open (dummy SSID)  c=close
      * r=simulate tapping the keyboard's checkmark (LV_EVENT_READY) with a
      * dummy password -- exercises the real connect-and-close path. */
@@ -1458,6 +1656,12 @@ void loop() {
       DBG("watchdog test: spinning with no kicks, should self-reset shortly");
       while (1) { /* no wdKick() on purpose */ }
     }
+    else if (cmd == 'i') openReconModal();       /* open the recon target-IP modal */
+    else if (cmd == 'k') {                       /* submit a dummy target (RFC 5737 TEST-NET-1,
+                                                   * non-routable -- safe for automated testing) */
+      if (reconTa) lv_textarea_set_text(reconTa, "192.0.2.1");
+      if (reconKb) lv_obj_send_event(reconKb, LV_EVENT_READY, NULL);
+    }
   }
 
   if (scanPending    && --scanPending == 0)    { DBG("loop: scan start"); performScan(); DBG("loop: scan end"); }
@@ -1469,6 +1673,10 @@ void loop() {
   if (ssidClosePending && --ssidClosePending == 0) {
     closeSsidModal();
     if (ssidSubmitted) openPwModal();   /* chain into the normal password/connect flow */
+  }
+  if (reconClosePending && --reconClosePending == 0) {
+    closeReconModal();
+    if (reconSubmitted) performReconScan();
   }
   if (portalCheckPending && --portalCheckPending == 0) checkCaptivePortal();
   delay(4);
