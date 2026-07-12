@@ -37,6 +37,7 @@
 #include <Arduino_BMI270_BMM150.h>
 #include <PDM.h>
 #include <Arduino_AdvancedAnalog.h>
+#include "drivers/Watchdog.h"        /* hardware watchdog -- auto-recover from any future freeze */
 
 /* ================= hardware configuration ================= */
 
@@ -62,6 +63,18 @@ static const char   *ANALOG_NAME[4] = { "A0", "A1", "A2", "A3" };
 /* debug bisect switches — turn shield peripherals off to isolate a freeze */
 #define EN_IMU 1     /* BMI270 on Wire1 (shared with the GT911 touch controller!) */
 #define EN_MIC 1     /* PDM microphone (ISR capture) */
+
+/* Hardware watchdog: if the sketch ever hangs (a bug nobody's found yet,
+ * a peripheral fault, anything), the board resets itself instead of
+ * needing a manual power-cycle -- see setup()/loop() for start + the
+ * per-iteration kick. WiFi.begin()/scanNetworks()/checkCaptivePortal()
+ * are the only calls in this file that can legitimately block long enough
+ * to matter (WiFi.begin() alone can take up to ~7s to connect *after* an
+ * internal scan that can itself take several seconds -- confirmed by
+ * reading WiFi.cpp: begin() with no explicit security always re-scans
+ * first), so each of those gets an explicit kick on either side of the
+ * call on top of the per-loop() kick. */
+static void wdKick() { mbed::Watchdog::get_instance().kick(); }
 
 /* ---- persistent settings (flash-backed, survive reboot & re-upload) ---- */
 #define EN_KV 1      /* persistent settings across reboots (WiFi creds, BLE, brightness, rate) */
@@ -153,6 +166,7 @@ static lv_obj_t *dashWifiLbl, *dashBleLbl, *dashUpLbl;
 static lv_obj_t *wifiStatusLbl, *wifiList, *scanBtn;
 static lv_obj_t *bleStatusLbl, *bleSw;
 static lv_obj_t *pwModal = NULL, *pwTa, *pwTitle, *pwKb;
+static lv_obj_t *ssidModal = NULL, *ssidTa, *ssidKb;
 static lv_obj_t *accBar[3], *gyroBar[3], *accLbl, *gyroLbl, *imuStatusLbl;
 static lv_obj_t *micBar, *micLbl, *micChart, *toneFreqLbl;
 static lv_chart_series_t *micSer;
@@ -345,8 +359,8 @@ static void updateWifiStatus() {
     IPAddress ip = WiFi.localIP();
     if (wifiPortalSuspected) {
       lv_label_set_text_fmt(wifiStatusLbl,
-          LV_SYMBOL_WARNING "  Connected to %s -- internet not confirmed\n"
-          "IP %u.%u.%u.%u    this network may need sign-in (open a browser on another device)",
+          LV_SYMBOL_WARNING "  Connected to %s -- sign-in may be required\n"
+          "IP %u.%u.%u.%u  (open a browser on another device to sign in)",
           WiFi.SSID(), ip[0], ip[1], ip[2], ip[3]);
       lv_obj_set_style_text_color(wifiStatusLbl, lv_color_hex(C_WARN), 0);
     } else {
@@ -357,7 +371,7 @@ static void updateWifiStatus() {
     }
   } else if (wifiConnectFailed) {
     lv_label_set_text_fmt(wifiStatusLbl,
-        LV_SYMBOL_CLOSE "  Couldn't connect to %s -- check the password", pendingSsid);
+        LV_SYMBOL_CLOSE "  Couldn't connect to %s\ncheck the password and try again", pendingSsid);
     lv_obj_set_style_text_color(wifiStatusLbl, lv_color_hex(C_DANGER), 0);
   } else {
     lv_label_set_text(wifiStatusLbl, LV_SYMBOL_CLOSE "  Not connected");
@@ -374,6 +388,7 @@ static void updateWifiStatus() {
  * file) -- DNS + connect + response can take several seconds. */
 static void checkCaptivePortal() {
   DBG("portal: checking");
+  wdKick();
   WiFiClient client;
   client.setSocketTimeout(4000);
   bool suspected = true;   /* assume no confirmed internet until proven otherwise */
@@ -383,6 +398,7 @@ static void checkCaptivePortal() {
     uint32_t start = millis();
     size_t n = 0;
     while (millis() - start < 4000 && n < sizeof(statusLine) - 1) {
+      wdKick();
       if (client.available()) {
         char c = client.read();
         if (c == '\n' || c == '\r') break;
@@ -419,8 +435,11 @@ static void requestConnect() {
 
 static void performConnect() {
   WiFi.disconnect();
+  wdKick();   /* WiFi.begin() with no explicit security re-scans internally
+               * before connecting -- can legitimately take several seconds */
   int st = strlen(pendingPass) ? WiFi.begin(pendingSsid, pendingPass)
                                : WiFi.begin(pendingSsid);
+  wdKick();
   if (st == WL_CONNECTED) {          /* remember the network for next boot */
     kvSaveStr("/kv/wifi_ssid", pendingSsid);
     kvSaveStr("/kv/wifi_pass", pendingPass);
@@ -499,6 +518,65 @@ static void openPwModal() {
   DBG("modal: open");
 }
 
+/* Manual/hidden-SSID entry ("Other network..." button). Same create-fresh,
+ * defer-close-out-of-the-callback pattern as the password modal above --
+ * ssidKbCb only captures text and arms a countdown; loop() does the actual
+ * close, then chains straight into openPwModal() for the typed SSID so an
+ * open (no-password) hidden network still works via the normal blank-
+ * password path in performConnect(). */
+static volatile uint8_t ssidClosePending = 0;
+static volatile bool    ssidSubmitted = false;
+
+static void closeSsidModal() {
+  if (ssidModal) { lv_obj_delete(ssidModal); ssidModal = NULL; }
+  lv_obj_set_style_bg_opa(lv_layer_top(), LV_OPA_TRANSP, 0);
+  lv_obj_remove_flag(lv_layer_top(), LV_OBJ_FLAG_CLICKABLE);
+}
+
+static void ssidKbCb(lv_event_t *e) {
+  lv_event_code_t code = lv_event_get_code(e);
+  if (code == LV_EVENT_READY) {
+    strlcpy(pendingSsid, lv_textarea_get_text(ssidTa), sizeof(pendingSsid));
+    ssidSubmitted = true;
+    ssidClosePending = 5;
+  } else if (code == LV_EVENT_CANCEL) {
+    ssidSubmitted = false;
+    ssidClosePending = 5;
+  }
+}
+
+static void openSsidModal() {
+  lv_obj_set_style_bg_color(lv_layer_top(), lv_color_hex(0x000000), 0);
+  lv_obj_set_style_bg_opa(lv_layer_top(), LV_OPA_50, 0);
+  lv_obj_add_flag(lv_layer_top(), LV_OBJ_FLAG_CLICKABLE);
+
+  ssidModal = lv_obj_create(lv_layer_top());
+  lv_obj_set_size(ssidModal, 560, 380);
+  lv_obj_center(ssidModal);
+  lv_obj_add_style(ssidModal, &stCard, 0);
+  lv_obj_remove_flag(ssidModal, LV_OBJ_FLAG_SCROLLABLE);
+
+  lv_obj_t *title = lv_label_create(ssidModal);
+  lv_label_set_text(title, LV_SYMBOL_WIFI "  Enter network name (SSID)");
+  lv_obj_add_style(title, &stCardTitle, 0);
+  lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 0);
+
+  ssidTa = lv_textarea_create(ssidModal);
+  lv_textarea_set_one_line(ssidTa, true);
+  lv_textarea_set_placeholder_text(ssidTa, "network name");
+  lv_obj_set_width(ssidTa, 400);
+  lv_obj_align(ssidTa, LV_ALIGN_TOP_MID, 0, 40);
+
+  ssidKb = lv_keyboard_create(ssidModal);
+  lv_obj_set_size(ssidKb, 520, 230);
+  lv_obj_align(ssidKb, LV_ALIGN_BOTTOM_MID, 0, 0);
+  lv_keyboard_set_textarea(ssidKb, ssidTa);
+  lv_obj_add_event_cb(ssidKb, ssidKbCb, LV_EVENT_ALL, NULL);
+  DBG("ssid modal: open");
+}
+
+static void otherNetworkCb(lv_event_t *e) { (void)e; openSsidModal(); }
+
 static void wifiItemCb(lv_event_t *e) {
   int i = (int)(uintptr_t)lv_event_get_user_data(e);
   DBG("item: enter");
@@ -530,9 +608,11 @@ static void wifiScanCb(lv_event_t *e) {
 
 static void performScan() {
   DBG("scan: begin");
+  wdKick();
   if (Serial) { Serial.print("scan: status="); Serial.println(WiFi.status());
                 Serial.print("scan: fw=");     Serial.println(WiFi.firmwareVersion()); }
   int n = WiFi.scanNetworks();
+  wdKick();
   if (Serial) { Serial.print("scan: found "); Serial.println(n); }
   if (n > 8) n = 8;
   for (int i = 0; wifiList && i < n; i++) {
@@ -643,6 +723,7 @@ static void sensorTimerCb(lv_timer_t *t) {
 static void imuTimerCb(lv_timer_t *t) {
   (void)t;
   if (!imuOk) return;
+  if (lv_tabview_get_tab_active(tabview) != 4) return;  /* tab 4 = IMU; nothing to update off-tab */
   float x, y, z;
   if (imu.accelerationAvailable() && imu.readAcceleration(x, y, z)) {
     lv_bar_set_value(accBar[0], (int)(x * 1000), LV_ANIM_OFF);
@@ -661,6 +742,7 @@ static void imuTimerCb(lv_timer_t *t) {
 static void audioTimerCb(lv_timer_t *t) {
   (void)t;
   if (!micOk) return;
+  if (lv_tabview_get_tab_active(tabview) != 5) return;  /* tab 5 = Audio; nothing to update off-tab */
   int n = micSamples;
   if (n <= 0) return;
   uint64_t acc = 0;
@@ -777,6 +859,8 @@ static void buildDashboard(lv_obj_t *tab) {
   lv_obj_t *c = makeCard(tab, 300, 130);
   cardTitle(c, LV_SYMBOL_WIFI, "Network");
   dashWifiLbl = lv_label_create(c);
+  lv_obj_set_width(dashWifiLbl, 270);   /* defensive: wrap a long SSID instead of overflowing the tile */
+  lv_label_set_long_mode(dashWifiLbl, LV_LABEL_LONG_MODE_WRAP);
   lv_obj_align(dashWifiLbl, LV_ALIGN_LEFT_MID, 0, 12);
   lv_label_set_text(dashWifiLbl, "...");
 
@@ -1035,9 +1119,13 @@ static void buildAudio(lv_obj_t *tab) {
 }
 
 static void buildWifi(lv_obj_t *tab) {
-  lv_obj_t *c = makeCard(tab, 642, 96);
+  lv_obj_t *c = makeCard(tab, 642, 118);   /* +22px over the original 96 -- headroom for a
+                                             * wrapped 3rd status line (long SSID, portal msg) */
   cardTitle(c, LV_SYMBOL_WIFI, "Wireless network");
   wifiStatusLbl = lv_label_create(c);
+  lv_obj_set_width(wifiStatusLbl, 610);              /* defensive: wrap instead of overflow the
+                                                       * card on a long SSID or status message */
+  lv_label_set_long_mode(wifiStatusLbl, LV_LABEL_LONG_MODE_WRAP);
   lv_obj_align(wifiStatusLbl, LV_ALIGN_BOTTOM_LEFT, 0, 0);
   lv_label_set_text(wifiStatusLbl, "Not connected");
   lv_obj_add_style(wifiStatusLbl, &stMuted, 0);
@@ -1059,6 +1147,15 @@ static void buildWifi(lv_obj_t *tab) {
   lv_obj_t *dl = lv_label_create(dcBtn);
   lv_label_set_text(dl, LV_SYMBOL_CLOSE " Disconnect");
   lv_obj_center(dl);
+
+  lv_obj_t *otherBtn = lv_button_create(c);
+  lv_obj_set_size(otherBtn, 150, 40);
+  lv_obj_align(otherBtn, LV_ALIGN_RIGHT_MID, -260, 6);
+  lv_obj_set_style_bg_color(otherBtn, lv_color_hex(0x334155), 0);
+  lv_obj_add_event_cb(otherBtn, otherNetworkCb, LV_EVENT_CLICKED, NULL);
+  lv_obj_t *ol = lv_label_create(otherBtn);
+  lv_label_set_text(ol, LV_SYMBOL_PLUS " Other...");
+  lv_obj_center(ol);
 
   /* NOTE: lv_list is NOT used here on purpose — rendering lv_list items
    * (both lv_list_add_text and lv_list_add_button) hard-freezes the GIGA
@@ -1135,6 +1232,9 @@ static void buildSettings(lv_obj_t *tab) {
   c = makeCard(tab, 314, 260);
   cardTitle(c, LV_SYMBOL_LIST, "System");
   sysInfoLbl = lv_label_create(c);
+  lv_obj_set_width(sysInfoLbl, 286);   /* defensive: wrap a long SSID on the WiFi line instead
+                                        * of overflowing the card */
+  lv_label_set_long_mode(sysInfoLbl, LV_LABEL_LONG_MODE_WRAP);
   lv_obj_add_style(sysInfoLbl, &stMuted, 0);
   lv_obj_align(sysInfoLbl, LV_ALIGN_TOP_LEFT, 0, 30);
   lv_label_set_text(sysInfoLbl, "...");
@@ -1161,6 +1261,16 @@ static void buildSettings(lv_obj_t *tab) {
 
 void setup() {
   Serial.begin(115200);
+
+  /* watchdog first, before anything that could hang -- see wdKick() comment */
+  mbed::Watchdog &watchdog = mbed::Watchdog::get_instance();
+  uint32_t wdMax = watchdog.get_max_timeout();
+  uint32_t wdTimeout = wdMax < 20000 ? wdMax : 20000;
+  watchdog.start(wdTimeout);
+  if (Serial) {
+    Serial.print("watchdog: started timeout="); Serial.print(wdTimeout);
+    Serial.print(" max="); Serial.println(wdMax);
+  }
 
   /* hardware first */
   for (int i = 0; i < 4; i++) { pinMode(RELAY_PIN[i], OUTPUT); digitalWrite(RELAY_PIN[i], LOW); }
@@ -1253,6 +1363,7 @@ void setup() {
 }
 
 void loop() {
+  wdKick();
   lv_timer_handler();
   if (bleEnabled) blePoll();
 
@@ -1288,6 +1399,20 @@ void loop() {
         lv_obj_send_event(lv_obj_get_child(wifiList, 0), LV_EVENT_CLICKED, NULL);
     }
     else if (cmd == 'g') checkCaptivePortal();   /* run the connectivity check directly */
+    else if (cmd == 'b') {                       /* toggle BLE, same as tapping the switch */
+      if (lv_obj_has_state(bleSw, LV_STATE_CHECKED)) lv_obj_remove_state(bleSw, LV_STATE_CHECKED);
+      else lv_obj_add_state(bleSw, LV_STATE_CHECKED);
+      lv_obj_send_event(bleSw, LV_EVENT_VALUE_CHANGED, NULL);
+    }
+    else if (cmd == 'o') otherNetworkCb(NULL);   /* open the manual-SSID modal */
+    else if (cmd == 'y') {                       /* submit a dummy hidden SSID */
+      if (ssidTa) lv_textarea_set_text(ssidTa, "DummyHiddenNet");
+      if (ssidKb) lv_obj_send_event(ssidKb, LV_EVENT_READY, NULL);
+    }
+    else if (cmd == 'x') {   /* deliberately hang forever -- verifies the watchdog resets us */
+      DBG("watchdog test: spinning with no kicks, should self-reset shortly");
+      while (1) { /* no wdKick() on purpose */ }
+    }
   }
 
   if (scanPending    && --scanPending == 0)    { DBG("loop: scan start"); performScan(); DBG("loop: scan end"); }
@@ -1295,6 +1420,10 @@ void loop() {
   if (kbClosePending && --kbClosePending == 0) {
     closePwModal();
     if (kbConnectAfterClose) requestConnect();
+  }
+  if (ssidClosePending && --ssidClosePending == 0) {
+    closeSsidModal();
+    if (ssidSubmitted) openPwModal();   /* chain into the normal password/connect flow */
   }
   if (portalCheckPending && --portalCheckPending == 0) checkCaptivePortal();
   delay(4);

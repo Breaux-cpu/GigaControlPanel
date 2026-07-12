@@ -13,7 +13,7 @@ Shield** + **Arduino 4 Relays Shield**, built with LVGL 9.
 | **Sensors** | Scrolling live chart of A0 + value bars for A0–A3 (raw + volts), update-rate control |
 | **IMU** | Display Shield BMI270: live accelerometer (g) and gyroscope (dps) bars |
 | **Audio** | Display Shield PDM microphone level meter + history chart; sine-tone generator out the audio jack (DAC0 / A12) with frequency slider |
-| **WiFi** | Scan networks, tap one, type the password on the on-screen keyboard, connect / disconnect; open networks connect directly. After connecting, automatically checks for a captive portal (sign-in page) and flags it if found; shows a specific error if the connect attempt fails |
+| **WiFi** | Scan networks, tap one, type the password on the on-screen keyboard, connect / disconnect; open networks connect directly. "Other network…" lets you type a hidden/out-of-range SSID by hand. After connecting, automatically checks for a captive portal (sign-in page) and flags it if found; shows a specific error if the connect attempt fails |
 | **BLE** | Toggle a BLE peripheral (`GIGA-Control`) that lets a phone control relays & motors and stream A0 |
 | **Settings** | Display brightness, sensor update rate, system info, safety notes |
 
@@ -61,10 +61,15 @@ scanned network button, `p`/`c` open/close the password modal directly
 connect-and-close path without needing a physical touch, which is how the
 `kbCb` freeze (see Caveats) was actually reproduced and fixed. `g` runs
 the captive-portal connectivity check directly (useful to test it without
-needing an actual captive-portal network). A timestamped `hb` heartbeat
-prints once a second while a monitor is attached, including live LVGL heap
-stats (`free`/`big`/`frag`) — useful for catching memory issues before they
-cause a freeze.
+needing an actual captive-portal network). `o`/`y` open the manual-SSID
+modal and submit a dummy hidden SSID (chains into the password modal, same
+as tapping "Other network…" for real). `b` toggles BLE, same as tapping its
+switch. `x` deliberately hangs forever with no watchdog kicks — used to
+verify the watchdog actually resets the board (see Caveats); don't send it
+unless you mean it, the board will reboot a few seconds later. A
+timestamped `hb` heartbeat prints once a second while a monitor is
+attached, including live LVGL heap stats (`free`/`big`/`frag`) — useful for
+catching memory issues before they cause a freeze.
 
 ## WiFi connect states
 
@@ -80,7 +85,9 @@ The WiFi tab's status line distinguishes:
 
 **Captive portals**: a network that requires "sign in to continue" in a browser will still let this device associate and get an IP — `WiFi.begin()` reports success — but blocks real traffic until sign-in completes. This device has no browser to show that page, so it can only *detect* the situation (a standard technique: fetch `http://connectivitycheck.gstatic.com/generate_204`, which a captive portal intercepts) and tell you to complete sign-in on another device (phone/laptop) connected to the same network. It cannot complete sign-in itself. This check runs automatically ~0.6s after every successful connect (including the auto-reconnect-on-boot), and can be re-run manually via the `g` serial command.
 
-**Known gaps, not implemented**: no way to enter a hidden/non-broadcasting SSID by hand (only scanned networks can be picked); no WPA2-Enterprise (802.1X username+password) support, only the personal PSK mode `WiFi.begin(ssid, pass)` provides.
+**Hidden/manual SSID entry**: tap "Other network…" on the WiFi tab to type a network name by hand (for hidden or out-of-range networks not in the scan list). Submitting it opens the normal password keyboard for that SSID — leave the password blank and submit for an open network. Built with the same create-fresh, defer-close-out-of-the-callback pattern as the password modal (see Caveats) to avoid the same class of freeze.
+
+**Known gap, not implemented, and not planned**: no WPA2-Enterprise (802.1X username+password, the kind schools/corporate offices use) support. Checked the installed WiFi library headers directly — only `begin(ssid)` and `begin(ssid, passphrase, security)` exist, no EAP/802.1X anywhere. Supporting it would mean dropping below the Arduino WiFi library to raw mbed network APIs, too large an effort for what's fundamentally a home-network control panel.
 
 ## BLE protocol (service `19B10000-E8F2-537E-4F6C-D104768A1214`)
 
@@ -130,8 +137,26 @@ Test with **nRF Connect** or **LightBlue** on your phone.
 - `Serial` prints are guarded by `if (Serial)` (the `DBG` macro): on this mbed
   core an unguarded print blocks forever if a monitor attached once and went
   away.
-- WiFi and BLE share the GIGA's Murata radio module. Coexistence mostly works,
-  but if either gets flaky, use one at a time.
+- WiFi and BLE share the GIGA's Murata radio module. Ran both simultaneously
+  for 3+ minutes (WiFi connected + BLE advertising, switching tabs and
+  rescanning throughout) with no issues — stable heap, no drops. If either
+  still gets flaky in practice, fall back to using one at a time.
+- **Hardware watchdog** (`mbed::Watchdog`, `drivers/Watchdog.h`): started in
+  `setup()` at `min(20000ms, get_max_timeout())`, kicked once per `loop()`
+  iteration plus explicitly around `performScan()`, `performConnect()`, and
+  `checkCaptivePortal()` — the only calls that can legitimately block long
+  enough to matter (`WiFi.begin()` with no explicit security re-scans
+  internally before connecting, confirmed by reading `WiFi.cpp`). If the
+  sketch ever hangs — a bug nobody's found yet, a peripheral fault, anything
+  — the board resets itself instead of needing a manual power-cycle.
+  Verified with a real test, not just code review: the `x` serial command
+  spins forever with no kicks, and `dmesg` confirmed an actual USB
+  disconnect/reconnect (the board resetting) followed by a clean reboot.
+- **`imuTimerCb`/`audioTimerCb` only run while their own tab is active**
+  (checked via `lv_tabview_get_tab_active(tabview)`) — no point polling the
+  IMU over I²C or computing mic RMS for bars nobody can see. `sensorTimerCb`
+  deliberately stays ungated since the Dashboard's A0 gauge depends on it
+  running on every tab.
 - **Settings now persist across reboots** via mbed KVStore (`kvstore_global_api.h`,
   keys prefixed `/kv/`): WiFi SSID/password (auto-reconnects on boot), BLE
   enabled state, display brightness, sensor update rate. Disconnecting WiFi
@@ -140,6 +165,30 @@ Test with **nRF Connect** or **LightBlue** on your phone.
   call sites.
 - Relays switch mains-capable contacts — treat the shield's screw terminals
   with respect if you put line voltage on them.
+- Three status labels (`wifiStatusLbl`, `dashWifiLbl`, `sysInfoLbl`) display
+  a live SSID (up to 32 chars) or a generated message and previously had no
+  width/wrap constraint — a long real-world SSID or the captive-portal
+  message could overflow its card. Fixed with explicit
+  `lv_obj_set_width()` + `lv_label_set_long_mode(..., LV_LABEL_LONG_MODE_WRAP)`
+  on all three, the WiFi status card grew 96→118px tall for wrap headroom,
+  and the portal/failure message text was shortened. Verified functionally
+  (compiles, connects, fails-gracefully, no crash) but **not yet visually
+  confirmed on the actual screen** — see Pending below.
+
+## Pending (needs the user physically at the board)
+
+Two things from the latest optimization pass couldn't be finished remotely:
+
+1. **Hardware verification.** Everything validated this session was driven
+   over serial with only the heartbeat/memory telemetry as a witness.
+   Relays, motors (needs an external H-bridge — confirm one's actually
+   wired up), sensor voltage tracking, IMU response to physical movement,
+   audio tone/mic, and BLE control from a real phone app have not been
+   confirmed against actual hardware.
+2. **Visual UI check.** The text-overflow fixes above and the new "Other
+   network…" button placement (150×40 at `LV_ALIGN_RIGHT_MID` offset
+   `-260,6` on the WiFi card) are reasoned through the numbers but not
+   seen on screen.
 
 ## LVGL heap (`LV_MEM_SIZE`)
 
