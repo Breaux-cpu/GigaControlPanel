@@ -15,7 +15,7 @@ Shield** + **Arduino 4 Relays Shield**, built with LVGL 9.
 | **Audio** | Display Shield PDM microphone level meter + history chart; sine-tone generator out the audio jack (DAC0 / A12) with frequency slider |
 | **WiFi** | Scan networks, tap one, type the password on the on-screen keyboard, connect / disconnect; open networks connect directly. "Other network…" lets you type a hidden/out-of-range SSID by hand. After connecting, automatically checks for a captive portal (sign-in page) and flags it if found; shows a specific error if the connect attempt fails |
 | **BLE** | Toggle a BLE peripheral (`GIGA-Control`) that lets a phone control relays & motors and stream A0 |
-| **Settings** | Display brightness, sensor update rate, system info, safety notes |
+| **Settings** | Display brightness, sensor update rate, system info, safety notes, and an **Automation rule** entry point — see the Automation section below |
 | **Recon** | TCP connect-scan of a user-entered target IP across 8 common ports (or a custom port list), with a short scan-history strip. **For authorized security testing only** — see the Recon section below |
 | **MQTT** | Connect to an MQTT broker to publish relay/sensor state and accept remote relay commands — see the MQTT section below |
 
@@ -106,7 +106,9 @@ guaranteed non-routable — safe for automated testing, though note this is
 also the *slowest* case for a scan, see the Recon section for why). `x`
 deliberately hangs forever with no watchdog kicks — used to verify the
 watchdog actually resets the board (see Caveats); don't send it unless you
-mean it, the board will reboot a few seconds later. A timestamped `hb`
+mean it, the board will reboot a few seconds later. `z` opens the Automation
+rule modal; `Z` types a test spec (`A2 below 300 R2 on`) and submits it,
+exercising the real parse/save/close path. A timestamped `hb`
 heartbeat prints once a second while a monitor is
 attached, including live LVGL heap stats (`free`/`big`/`frag`) — useful for
 catching memory issues before they cause a freeze.
@@ -159,6 +161,24 @@ Topics, all under the `giga-control/` prefix:
 **Same `connect()` caveat as the Recon scan**: `WiFiClient::connect()` to an unreachable broker isn't bounded by any timeout on this core, so the watchdog is paused around the connect (see the Recon limitation above). A dropped connection auto-reconnects on a slow (~3 s) cadence while the switch is on.
 
 **Why the tab is built lazily** (see Caveats): this 11th tab's widgets don't fit the LVGL pool as permanent objects, so they exist only while the tab is on screen. The MQTT *connection* is independent of the tab — it stays up as you navigate elsewhere; only the on-screen controls come and go.
+
+## Automation rule (one sensor-threshold → relay)
+
+On the **Settings** tab, tap **"Automation rule"** to open a small keyboard modal. Type a one-line rule and submit (the checkmark):
+
+```
+A0 above 512 R4 on
+```
+
+- **`A0`–`A3`** — which analog input to watch
+- **`above`/`below`** (or `>`/`<`) — direction
+- a bare number **0–1023** — the raw-ADC threshold
+- **`R1`–`R4`** — which relay to drive
+- **`on`/`off`** — whether the rule is enabled
+
+Parsing is case- and space-tolerant, and any field you leave out keeps its current value. The modal pre-fills with the current rule, so you can edit one part and resubmit. The rule is evaluated live (every sensor tick) and drives the relay **only when the desired state changes**, so it never flaps or spams the BLE/MQTT relay mirrors. It's saved to KVStore and restored on boot; the Settings label shows the active rule (e.g. `Auto: A0 above 512 -> Relay 4`) or `Automation: off`.
+
+**Why a keyboard, and why it opens over the MQTT tab** (see Caveats): a richer tap-to-cycle form doesn't fit — a modal on `lv_layer_top` can hold only ~3–4 child objects before its render OOM-hangs this 64 KB pool. A keyboard is a single widget, so it fits. But LVGL still renders the *active tab behind* the modal, and the Settings tab's shadowed cards starve the keyboard's render — so opening the rule modal transparently parks on the empty (lazy) MQTT tab, like the broker modal, and restores Settings on close.
 
 ## BLE protocol (service `19B10000-E8F2-537E-4F6C-D104768A1214`)
 
@@ -218,6 +238,25 @@ Test with **nRF Connect** or **LightBlue** on your phone.
   MQTT widgets are still allocated alongside it. General rule: any new tab
   from here on must be lazy, and any modal-plus-tab combo must free the tab
   before allocating the modal.
+- **A modal on `lv_layer_top` can hold only ~3–4 child objects before its
+  render OOM-hangs, and LVGL renders the *active tab behind* it regardless of
+  backdrop opacity.** Both bisected live on hardware while adding the
+  Automation rule. First: a multi-widget tap-row config form (labels + a
+  slider + a switch, or even just clickable labels) froze the render — a
+  serial-controlled row-count sweep showed 2 rows render but ~5 hang, while a
+  container-only modal is fine. So the rule modal is a single **keyboard**
+  widget instead (its ~30 cells draw in one pass, like the proven password /
+  broker modals). Second: even the keyboard hung when opened over the Settings
+  tab, and making the `lv_layer_top` backdrop fully opaque did **not** help —
+  LVGL still renders the busy tab underneath, and its shadowed cards starve
+  the keyboard's render. The proven working modals all open over emptied/light
+  content (the broker frees its tab; Recon cleans its result list), so the
+  rule modal switches to the empty lazy MQTT tab before opening and restores
+  the prior tab on close. Third: **close must free the keyboard before
+  switching back** to the heavy Settings tab, or the restore render OOM-hangs
+  the same way (both steps run in one `loop()` iteration, so nothing flashes
+  on screen between them). Takeaway: prefer a keyboard over a bespoke widget
+  form for any new modal here, and open it over light content.
 - **`WiFiClient::setSocketTimeout()` does not bound `connect()` on this
   core.** Found while testing the Recon scan, not assumed: reading
   `MbedClient.cpp` shows `connect(IPAddress, port)` calls `sock->connect()`
