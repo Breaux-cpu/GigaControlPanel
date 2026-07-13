@@ -1,0 +1,19 @@
+# Arduino build artifacts (arduino-cli's own cache lives outside this repo
+# at ~/.cache/arduino/sketches/, but ignore common local-build locations
+# defensively in case that ever changes or someone builds via the IDE)
+build/
+.cache/
+*.hex
+*.bin
+*.elf
+*.map
+
+# Editor/OS cruft
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Never commit secrets or local overrides
+.env
+*.local

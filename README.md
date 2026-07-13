@@ -236,3 +236,7 @@ currently `(64 * 1024U)`. A `arduino-cli core update`/reinstall will revert
 any edit here back to the stock value (also 64KB by default, so a stock
 reinstall happens to match what this sketch expects — but don't assume that
 stays true across core versions).
+
+## License
+
+MIT — see [LICENSE](LICENSE).
