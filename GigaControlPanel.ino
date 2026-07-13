@@ -39,6 +39,7 @@
 #include <PDM.h>
 #include <Arduino_AdvancedAnalog.h>
 #include <MQTTClient.h>             /* 256dpi/arduino-mqtt -- remote monitor + control over MQTT */
+#include <Arduino_Portenta_OTA.h>   /* WiFi firmware update (GIGA shares Portenta H7's OTA path) */
 #include "drivers/Watchdog.h"        /* hardware watchdog -- auto-recover from any future freeze */
 
 /* ================= hardware configuration ================= */
@@ -203,6 +204,16 @@ static uint16_t      mqttConnectPending = 0; /* loop() runs the (possibly-blocki
 static uint8_t       mqttClosePending   = 0;
 static bool          mqttSubmitted      = false;
 static lv_obj_t *mqttModal = NULL, *mqttTa, *mqttKb;
+
+/* ---- OTA (WiFi firmware update, MQTT-triggered) ----
+ * Publish a packaged .ota image's URL to MQTT_PREFIX "/ota/update"; the GIGA
+ * pulls it over the WiFi it's already on, stages it to QSPI, and lets the
+ * bootloader flash it on reset. The set-then-run split keeps the (blocking,
+ * multi-second) download out of the MQTT callback -- loop() runs it. USB DFU
+ * stays the recovery path if an image is ever bad. Build/serve/publish with
+ * tools/giga-ota.sh on jessy. */
+static volatile bool otaRequested = false;
+static String        otaUrl;                 /* full URL, taken from the MQTT payload */
 static lv_obj_t *mqttStatusLbl, *mqttBrokerLbl, *mqttActivityLbl, *mqttSw;
 /* The MQTT tab is built LAZILY -- its widgets exist only while the tab is
  * actually on screen, then are freed on leaving it. This 11th tab's
@@ -1683,6 +1694,49 @@ static void mqttPublishRelays() {
   mqttClient.publish(MQTT_PREFIX "/relays", buf, true, 0);
 }
 
+/* Report OTA progress both to the remote (MQTT) and the on-screen activity
+ * line, so an update is visible from either side. */
+static void otaPublish(const char *s) {
+  if (mqttClient.connected()) mqttClient.publish(MQTT_PREFIX "/ota/status", s, false, 0);
+  mqttSetActivity(s);
+}
+
+/* Run a WiFi firmware update. Called from loop() when an OTA was requested
+ * over MQTT -- never from the callback, since the download blocks for seconds
+ * (the UI freezes; the OTA library feeds the watchdog via wdKick throughout).
+ * On success it does not return: the board resets and the bootloader flashes
+ * the staged image. Any early return leaves the running firmware untouched. */
+static void runOta() {
+  otaRequested = false;
+  String url = otaUrl;
+  if (url.length() == 0) { otaPublish("ota: no url given"); return; }
+  bool is_https = url.startsWith("https:");
+
+  otaPublish("ota: starting");
+  wdKick();
+
+  Arduino_Portenta_OTA_QSPI ota(QSPI_FLASH_FATFS_MBR, 2);
+  if (!ota.isOtaCapable()) { otaPublish("ota: bootloader too old -- update it over USB once"); return; }
+  ota.setFeedWatchdogFunc(wdKick);
+
+  if (ota.begin() != Arduino_Portenta_OTA::Error::None) { otaPublish("ota: storage init failed"); return; }
+
+  otaPublish("ota: downloading");
+  int const dl = ota.downloadAndDecompress(url.c_str(), is_https);
+  if (dl <= 0) {
+    char b[40];
+    snprintf(b, sizeof b, "ota: download failed (%d)", dl);
+    otaPublish(b);
+    return;
+  }
+
+  if (ota.update() != Arduino_Portenta_OTA::Error::None) { otaPublish("ota: staging failed"); return; }
+
+  otaPublish("ota: applying, rebooting");
+  delay(600);   /* let the MQTT publish flush before the reset */
+  ota.reset();  /* no return -- bootloader takes over on reboot */
+}
+
 /* Incoming command handler. Runs from mqttClient.loop(), which we call from
  * our own loop() -- so this is NOT inside an LVGL event dispatch, and
  * touching widgets here is safe, exactly like blePoll() updating switches
@@ -1695,6 +1749,10 @@ static void mqttOnMessage(String &topic, String &payload) {
                                        (relayState[2] << 2) | (relayState[3] << 3));
     mqttSetActivity(LV_SYMBOL_DOWNLOAD "  rx relay/set");
     /* applyRelay set mqttRelaysDirty; loop() will echo the new state back. */
+  } else if (topic == MQTT_PREFIX "/ota/update") {
+    otaUrl = payload;             /* full .ota URL from the publisher (jessy) */
+    otaRequested = true;          /* loop() runs runOta() -- not here */
+    mqttSetActivity(LV_SYMBOL_DOWNLOAD "  rx ota/update");
   }
 }
 
@@ -1744,6 +1802,7 @@ static void performMqttConnect() {
   if (ok) {
     mqttClient.publish(MQTT_PREFIX "/status", "online", true, 0);
     mqttClient.subscribe(MQTT_PREFIX "/relay/set");
+    mqttClient.subscribe(MQTT_PREFIX "/ota/update");
     mqttPublishRelays();
     if (mqttStatusLbl) {
       lv_label_set_text_fmt(mqttStatusLbl, LV_SYMBOL_OK "  Connected to %s:%u", mqttHost, mqttPort);
@@ -2127,6 +2186,10 @@ void loop() {
       mqttConnectPending = 750;            /* ~3s at 4ms/loop between attempts */
     }
   }
+
+  /* WiFi firmware update, requested over MQTT. Runs here (not the callback)
+   * because it blocks for the whole download; feeds the watchdog internally. */
+  if (otaRequested) runOta();
 
   /* keep the DAC fed while a tone plays */
   if (toneOn && dac0.available()) {

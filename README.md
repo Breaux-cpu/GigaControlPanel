@@ -46,12 +46,44 @@ arduino-cli upload -p /dev/ttyACM0 --fqbn arduino:mbed_giga:giga ~/GigaControlPa
 
 Libraries: `lvgl` **9.x**, `Arduino_GigaDisplayTouch`, `Arduino_GigaDisplay`,
 `ArduinoBLE`, `Arduino_BMI270_BMM150`, `Arduino_AdvancedAnalog`, `MQTT`
-(256dpi/arduino-mqtt, `arduino-cli lib install MQTT`) — PDM and
+(256dpi/arduino-mqtt, `arduino-cli lib install MQTT`), `Arduino_Portenta_OTA`
+(`arduino-cli lib install Arduino_Portenta_OTA`, for WiFi updates) — PDM and
 Arduino_H7_Video ship with the core.
 
 If the upload fails with "No DFU capable USB device" and the board disappears
 from `lsusb`, the dock swallowed the DFU re-enumeration — replug the GIGA's USB
 cable or double-tap its RESET button, then upload again.
+
+## Update over WiFi (OTA)
+
+Once an OTA-capable build is on the board, you can update it over the WiFi it's
+already on — no USB, no DFU dance — with one command on jessy:
+
+```bash
+~/GigaControlPanel/tools/giga-ota.sh
+```
+
+That script compiles the sketch, packages it as a GIGA `.ota` image (Arduino's
+`lzss.py` + `bin2ota.py`, auto-fetched to `~/.local/share/giga-ota-tools`),
+serves it over plain HTTP on jessy's LAN address, and publishes the URL to
+`giga-control/ota/update`. The GIGA (subscribed to that topic) pulls the image
+over WiFi, stages it to QSPI flash, and reboots into it; progress is published
+back on `giga-control/ota/status`. Override defaults via env vars —
+`BROKER=`, `MQTT_PORT=`, `HTTP_PORT=`, `LAN_IP=` (set this if the GIGA can't
+reach jessy at the auto-detected address).
+
+**Two things to know:**
+
+- **Bootstrap once over USB.** OTA only works after firmware that *contains*
+  the OTA client is running, so the first flash with this feature still goes
+  over USB (above). Every update after that can go over WiFi.
+- **USB stays the recovery path.** A bad image can leave the GIGA needing the
+  USB DFU flash to recover — OTA removes the routine cable, not the safety net.
+  If a `giga-ota` update reports `bootloader too old`, run the core's
+  `PortentaH7_updateBootloader` example once over USB, then retry.
+
+The update itself blocks the UI for the download (a few seconds); the sketch's
+hardware watchdog is fed throughout by the OTA library, so it won't trip.
 
 ## Serial debug commands (115200 baud)
 
