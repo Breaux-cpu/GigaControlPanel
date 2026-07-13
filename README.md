@@ -17,6 +17,7 @@ Shield** + **Arduino 4 Relays Shield**, built with LVGL 9.
 | **BLE** | Toggle a BLE peripheral (`GIGA-Control`) that lets a phone control relays & motors and stream A0 |
 | **Settings** | Display brightness, sensor update rate, system info, safety notes |
 | **Recon** | TCP connect-scan of a user-entered target IP across 8 common ports (or a custom port list), with a short scan-history strip. **For authorized security testing only** — see the Recon section below |
+| **MQTT** | Connect to an MQTT broker to publish relay/sensor state and accept remote relay commands — see the MQTT section below |
 
 ## Pin map
 
@@ -44,8 +45,9 @@ arduino-cli upload -p /dev/ttyACM0 --fqbn arduino:mbed_giga:giga ~/GigaControlPa
 ```
 
 Libraries: `lvgl` **9.x**, `Arduino_GigaDisplayTouch`, `Arduino_GigaDisplay`,
-`ArduinoBLE`, `Arduino_BMI270_BMM150`, `Arduino_AdvancedAnalog` (PDM and
-Arduino_H7_Video ship with the core).
+`ArduinoBLE`, `Arduino_BMI270_BMM150`, `Arduino_AdvancedAnalog`, `MQTT`
+(256dpi/arduino-mqtt, `arduino-cli lib install MQTT`) — PDM and
+Arduino_H7_Video ship with the core.
 
 If the upload fails with "No DFU capable USB device" and the board disappears
 from `lsusb`, the dock swallowed the DFU re-enumeration — replug the GIGA's USB
@@ -107,6 +109,25 @@ A banner-grab step (reading the open socket's greeting right after `connect()`) 
 
 **Known limitation, found during testing, not just assumed**: `WiFiClient::setSocketTimeout()` does **not** bound the `connect()` phase on this core — confirmed by reading `MbedClient.cpp`: the timeout is only ever applied for the SSL variant and for I/O *after* a successful connect, never before a plain `connect()`. Scanning a **live, responsive** host is fast (proven against a real host on the local network: 8 ports in ~0.12s). Scanning an **unresponsive/offline** host is slow — each port's `connect()` falls back to the underlying mbed network stack's own default timeout, observed to take tens of seconds *total* across 8 ports rather than the sub-second the code originally assumed, and the whole UI is unresponsive for that entire duration (the scan runs synchronously in `loop()`, blocking `lv_timer_handler()` along with everything else). It always eventually completes on its own — confirmed by letting one run to completion rather than assuming — no crash, no permanent hang. The hardware watchdog is deliberately paused for the duration of a scan specifically because of this (a slow scan against an unresponsive host isn't the kind of hang the watchdog should "fix" by rebooting mid-scan) and resumed immediately after. If this becomes an actual annoyance, the real fix is a non-blocking `TCPSocket` + manual poll loop instead of `WiFiClient::connect()`, not a different timeout call.
 
+## MQTT tab — remote monitor & control
+
+Connect the panel to an MQTT broker over WiFi to publish its state and accept remote relay commands, using the [256dpi/arduino-mqtt](https://github.com/256dpi/arduino-mqtt) library over the existing `WiFiClient`. Tap **Set broker**, type `host` or `host:port` (defaults to 1883), then flip the connect switch. The broker address is saved to KVStore and survives a reboot; the panel does **not** auto-connect at boot (a blocking connect to an unreachable broker would stall startup — flip the switch when you want it).
+
+Topics, all under the `giga-control/` prefix:
+
+| Direction | Topic | Payload |
+|-----------|-------|---------|
+| publish | `giga-control/status` | `online` / `offline` — `offline` is also the Last-Will, so the broker announces an ungraceful drop |
+| publish (retained) | `giga-control/relays` | `0`–`15` bitmask of the four relays; retained so a late subscriber learns current state immediately |
+| publish (~1 Hz) | `giga-control/sensor/a0` | raw A0 reading |
+| **subscribe** | `giga-control/relay/set` | publish a `0`–`15` bitmask here to set all four relays at once — same encoding as the BLE relay characteristic |
+
+**Broker auth**: if your broker requires a username/password, set them in KVStore under `/kv/mqtt_user` and `/kv/mqtt_pass` — never hardcoded in source. Left unset, the panel connects anonymously.
+
+**Same `connect()` caveat as the Recon scan**: `WiFiClient::connect()` to an unreachable broker isn't bounded by any timeout on this core, so the watchdog is paused around the connect (see the Recon limitation above). A dropped connection auto-reconnects on a slow (~3 s) cadence while the switch is on.
+
+**Why the tab is built lazily** (see Caveats): this 11th tab's widgets don't fit the LVGL pool as permanent objects, so they exist only while the tab is on screen. The MQTT *connection* is independent of the tab — it stays up as you navigate elsewhere; only the on-screen controls come and go.
+
 ## BLE protocol (service `19B10000-E8F2-537E-4F6C-D104768A1214`)
 
 | Char | UUID suffix | Size | Access | Payload |
@@ -145,6 +166,26 @@ Test with **nRF Connect** or **LightBlue** on your phone.
   instead. If you're tempted to make a results list longer than 8 items
   anywhere in this file, verify the actual heap headroom with the `hb`
   telemetry rather than assuming it'll be fine.
+- **The pool is full: an 11th permanent tab does not fit, so the MQTT tab
+  is built lazily.** Adding the MQTT tab as permanent widgets dropped idle
+  free from ~6.8KB to ~3.8KB and the board **boot-looped** — the boot-time
+  WiFi/captive-portal allocations tipped that margin into an OOM hang the
+  watchdog reset every ~29s (bisected against an empty tab body, which
+  idles stable at ~6.8KB). The fix is to build the MQTT tab's widgets only
+  while the tab is actually on screen and free them on leave, so idle/boot
+  free stays at the stable ~6.8KB (the connection itself lives in globals,
+  independent of the view). Two follow-on hazards this exposed, both fixed
+  by testing rather than assumption: (1) the broker **keyboard modal**
+  (~2.2KB) can't coexist with the built tab either, so opening it frees the
+  tab first — deferred through `loop()`, never from the button's own click
+  callback (that's the delete-in-callback freeze again); (2) the tab must be
+  freed the *instant* the tab-change event fires, from a `tabview`
+  `LV_EVENT_VALUE_CHANGED` callback — **not** one `loop()` iteration later —
+  because LVGL renders the incoming tab before `loop()` resumes, and while
+  connected (free only ~4.5KB on this tab) that render OOM-hangs if the
+  MQTT widgets are still allocated alongside it. General rule: any new tab
+  from here on must be lazy, and any modal-plus-tab combo must free the tab
+  before allocating the modal.
 - **`WiFiClient::setSocketTimeout()` does not bound `connect()` on this
   core.** Found while testing the Recon scan, not assumed: reading
   `MbedClient.cpp` shows `connect(IPAddress, port)` calls `sock->connect()`
