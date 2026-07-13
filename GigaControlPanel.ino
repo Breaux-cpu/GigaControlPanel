@@ -98,12 +98,19 @@ static uint8_t kvLoadU8(const char *key, uint8_t dflt) {
   uint8_t v; size_t got = 0;
   return (kv_get(key, &v, 1, &got) == MBED_SUCCESS && got == 1) ? v : dflt;
 }
+static void kvSaveU16(const char *key, uint16_t v) { kv_set(key, &v, 2, 0); }
+static uint16_t kvLoadU16(const char *key, uint16_t dflt) {
+  uint16_t v; size_t got = 0;
+  return (kv_get(key, &v, 2, &got) == MBED_SUCCESS && got == 2) ? v : dflt;
+}
 static void kvRemove(const char *key) { kv_remove(key); }
 #else
 static void kvSaveStr(const char *, const char *) {}
 static bool kvLoadStr(const char *, char *, size_t) { return false; }
 static void kvSaveU8(const char *, uint8_t) {}
 static uint8_t kvLoadU8(const char *, uint8_t dflt) { return dflt; }
+static void kvSaveU16(const char *, uint16_t) {}
+static uint16_t kvLoadU16(const char *, uint16_t dflt) { return dflt; }
 static void kvRemove(const char *) {}
 #endif
 
@@ -234,6 +241,34 @@ static bool      mqttViewBuilt = false;
  * callback hazard that hard-froze this board twice before). */
 static volatile bool mqttModalWant = false;
 static bool          mqttModalOpen = false;
+
+/* ---- automation rule (one sensor-threshold -> relay rule) ----
+ * Evaluated in sensorTimerCb; it drives its target relay via applyRelay only
+ * on a *change* of the desired state, so it never flaps or spams the BLE/MQTT
+ * relay mirrors. Persisted across reboots in KVStore. Configured through a
+ * transient modal launched from the Settings tab (NOT a 12th tab -- the 64KB
+ * LVGL pool is full at 11 tabs; a modal costs no permanent tab slot and opens
+ * from the un-eroded 11-tab baseline). See openAutoModal() for why that modal
+ * is a keyboard (not a tap-row form) and why it parks on the empty MQTT tab. */
+static bool     autoEnabled   = false;
+static uint8_t  autoSensor    = 0;      /* 0..3 -> A0..A3            */
+static uint8_t  autoAbove     = 1;      /* 1 = rises above, 0 = falls below */
+static uint16_t autoThreshold = 512;    /* raw ADC 0..1023           */
+static uint8_t  autoRelay     = 0;      /* 0..3 -> relay 1..4        */
+static int8_t   autoActed     = -1;     /* last state driven onto the relay (-1 = not evaluated yet) */
+/* The rule is configured through a single-line KEYBOARD text-entry modal --
+ * the exact proven pattern of the WiFi-password / SSID / Recon modals. A
+ * multi-widget tap-row modal was tried and abandoned: a modal parented on
+ * lv_layer_top can hold only ~3-4 child objects before its render pass
+ * OOM-hangs this 64KB pool (bisected live on hardware -- 2 rows render, 5
+ * rows freeze). A keyboard is ONE widget whose ~30 cells draw in a single
+ * pass, so it fits where a handful of separate label objects don't. The user
+ * types a compact spec like "A0>512 R4 on"; parseAutoInput() reads it. */
+static lv_obj_t *autoModal = NULL, *autoTa, *autoKb, *autoLinkLbl = NULL;
+static volatile bool autoModalWant = false;  /* loop()/serial opens the modal */
+static uint8_t       autoClosePending = 0;    /* loop() closes it, outside any LVGL cb */
+static bool          autoSubmit = false;
+static uint8_t       autoReturnTab = 8;       /* tab to restore when the modal closes */
 
 /* styles */
 static lv_style_t stCard, stCardTitle, stMuted, stBig;
@@ -1024,17 +1059,34 @@ static int lastA0 = 0;
 
 static void sensorTimerCb(lv_timer_t *t) {
   (void)t;
+  int autoVal = 0;
   for (int i = 0; i < 4; i++) {
     int v = analogRead(ANALOG_PIN[i]);
     lv_bar_set_value(sensorBar[i], v, LV_ANIM_OFF);
     lv_label_set_text_fmt(sensorLbl[i], "%s   %4d   %d.%02d V",
         ANALOG_NAME[i], v, (v * 33) / 10230, ((v * 330) / 1023) % 100);
+    if (i == autoSensor) autoVal = v;
     if (i == 0) {
       lastA0 = v;
       lv_chart_set_next_value(chart, chartSer, v);
       int pct = (v * 100) / 1023;
       lv_arc_set_value(gaugeArc, pct);
       lv_label_set_text_fmt(gaugeLbl, "%d%%", pct);
+    }
+  }
+  /* automation rule: drive the target relay only when the desired state
+   * flips, so it neither flaps nor spams the relay/BLE/MQTT mirrors. */
+  if (autoEnabled) {
+    bool want = autoAbove ? (autoVal > autoThreshold) : (autoVal < autoThreshold);
+    if ((int8_t)want != autoActed) {
+      applyRelay(autoRelay, want);
+      autoActed = want;
+      if (Serial) {
+        char b[64];
+        snprintf(b, sizeof(b), "auto: %s %s %u -> relay %d %s", ANALOG_NAME[autoSensor],
+                 autoAbove ? ">" : "<", autoThreshold, autoRelay + 1, want ? "ON" : "OFF");
+        Serial.println(b);
+      }
     }
   }
 }
@@ -1356,7 +1408,7 @@ static void buildSensors(lv_obj_t *tab) {
   lv_obj_set_size(chart, 600, 160);
   lv_obj_align(chart, LV_ALIGN_BOTTOM_MID, 0, 0);
   lv_chart_set_type(chart, LV_CHART_TYPE_LINE);
-  lv_chart_set_point_count(chart, 60);
+  lv_chart_set_point_count(chart, 40);   /* trimmed 60->40 to reclaim LVGL pool for the automation modal */
   lv_chart_set_axis_range(chart, LV_CHART_AXIS_PRIMARY_Y, 0, 1023);
   lv_chart_set_update_mode(chart, LV_CHART_UPDATE_MODE_SHIFT);
   lv_chart_set_div_line_count(chart, 4, 8);
@@ -1439,7 +1491,7 @@ static void buildAudio(lv_obj_t *tab) {
   lv_obj_set_size(micChart, 600, 110);
   lv_obj_align(micChart, LV_ALIGN_BOTTOM_MID, 0, 0);
   lv_chart_set_type(micChart, LV_CHART_TYPE_LINE);
-  lv_chart_set_point_count(micChart, 80);
+  lv_chart_set_point_count(micChart, 48);   /* trimmed 80->48 to reclaim LVGL pool for the automation modal */
   lv_chart_set_axis_range(micChart, LV_CHART_AXIS_PRIMARY_Y, 0, 8000);
   lv_chart_set_update_mode(micChart, LV_CHART_UPDATE_MODE_SHIFT);
   lv_obj_set_style_bg_color(micChart, lv_color_hex(0x0E1730), 0);
@@ -1560,6 +1612,148 @@ static void buildBluetooth(lv_obj_t *tab) {
   lv_obj_add_style(txt, &stMuted, 0);
 }
 
+/* ================= automation-rule config modal ================= */
+
+/* Reflect the current rule onto the Settings entry-point label, so its state
+ * reads at a glance without opening the modal. */
+static void updateAutoLink() {
+  if (!autoLinkLbl) return;
+  if (autoEnabled)
+    lv_label_set_text_fmt(autoLinkLbl, LV_SYMBOL_BELL "  Auto: %s %s %u -> %s",
+                          ANALOG_NAME[autoSensor], autoAbove ? "above" : "below",
+                          autoThreshold, RELAY_NAME[autoRelay]);
+  else
+    lv_label_set_text(autoLinkLbl, LV_SYMBOL_BELL "  Automation: off   (tap to set)");
+}
+
+/* Render the current rule as the compact editable spec the modal pre-fills. */
+static void autoRuleToSpec(char *buf, size_t n) {
+  snprintf(buf, n, "%s %s %u R%d %s", ANALOG_NAME[autoSensor], autoAbove ? "above" : "below",
+           autoThreshold, autoRelay + 1, autoEnabled ? "on" : "off");
+}
+
+/* Parse a spec like "A0 above 512 R4 on" (case/space/symbol tolerant: ">"/"<"
+ * work in place of above/below). Tokens are matched by first character, so
+ * "a0" (sensor), "r4" (relay) and a bare number (threshold) never collide.
+ * Any field not present keeps its current value -- a partial edit is safe. */
+static void parseAutoInput(const char *raw) {
+  char b[80];
+  size_t j = 0;
+  for (size_t i = 0; raw[i] && j < sizeof(b) - 3; i++) {
+    char c = raw[i];
+    if (c >= 'A' && c <= 'Z') c += 32;                 /* lower-case, no ctype dep */
+    if (c == '>' || c == '<') { if (j) b[j++] = ' '; b[j++] = c; b[j++] = ' '; }
+    else b[j++] = c;
+  }
+  b[j] = '\0';
+
+  for (char *tok = strtok(b, " "); tok; tok = strtok(NULL, " ")) {
+    if      (tok[0] == 'a' && tok[1] >= '0' && tok[1] <= '3') autoSensor = tok[1] - '0';
+    else if (tok[0] == 'r' && tok[1] >= '1' && tok[1] <= '4') autoRelay  = tok[1] - '1';
+    else if (!strcmp(tok, "above") || !strcmp(tok, ">")) autoAbove = 1;
+    else if (!strcmp(tok, "below") || !strcmp(tok, "<")) autoAbove = 0;
+    else if (!strcmp(tok, "on")  || !strcmp(tok, "yes") || !strcmp(tok, "enable")  || !strcmp(tok, "enabled"))  autoEnabled = true;
+    else if (!strcmp(tok, "off") || !strcmp(tok, "no")  || !strcmp(tok, "disable") || !strcmp(tok, "disabled")) autoEnabled = false;
+    else if (tok[0] >= '0' && tok[0] <= '9') {
+      long t = strtol(tok, NULL, 10);
+      if (t < 0) t = 0;
+      if (t > 1023) t = 1023;
+      autoThreshold = (uint16_t)t;
+    }
+  }
+
+  autoActed = -1;   /* re-evaluate against the live sensor on the next tick */
+  kvSaveU8 ("/kv/auto_en",     autoEnabled ? 1 : 0);
+  kvSaveU8 ("/kv/auto_sensor", autoSensor);
+  kvSaveU8 ("/kv/auto_dir",    autoAbove);
+  kvSaveU8 ("/kv/auto_relay",  autoRelay);
+  kvSaveU16("/kv/auto_thr",    autoThreshold);
+  updateAutoLink();
+  if (Serial) { char s[48]; autoRuleToSpec(s, sizeof(s)); Serial.print("auto: rule saved "); Serial.println(s); }
+}
+
+static void closeAutoModal() {
+  /* Free the keyboard FIRST, then switch back to the (heavy) Settings tab.
+   * Order matters: restoring Settings renders its 4 shadowed cards, and doing
+   * that while the keyboard is still allocated spikes the pool into an OOM
+   * hang. All of this runs in one loop() iteration before the next render, so
+   * the empty MQTT tab is never actually shown between the two steps. */
+  if (autoModal) { lv_obj_delete(autoModal); autoModal = NULL; }
+  lv_obj_set_style_bg_opa(lv_layer_top(), LV_OPA_TRANSP, 0);
+  lv_obj_remove_flag(lv_layer_top(), LV_OBJ_FLAG_CLICKABLE);
+  lv_tabview_set_active(tabview, autoReturnTab, LV_ANIM_OFF);
+}
+
+/* Keyboard callback -- captures the typed spec and arms the deferred close,
+ * never deleting the modal from inside its own event dispatch (same pattern
+ * as reconKbCb/mqttKbCb). */
+static void autoKbCb(lv_event_t *e) {
+  lv_event_code_t code = lv_event_get_code(e);
+  if (code == LV_EVENT_READY) {
+    parseAutoInput(lv_textarea_get_text(autoTa));
+    autoSubmit = true;
+    autoClosePending = 5;
+  } else if (code == LV_EVENT_CANCEL) {
+    autoSubmit = false;
+    autoClosePending = 5;
+  }
+}
+
+/* Keyboard text-entry modal -- a single keyboard widget is the only modal
+ * shape proven to render on lv_layer_top within this 64KB pool (a multi-widget
+ * tap-row form OOM-hangs the render at ~3-4 child objects; see the globals
+ * note). Opened directly from the button cb like openReconModal: creating a
+ * modal is safe there -- only *deleting* an ancestor from its own cb is not. */
+static void openAutoModal() {
+  if (autoModal) return;   /* guard a double-open */
+
+  /* Render the modal over the (empty) MQTT tab, not Settings. LVGL still
+   * renders the active tab behind an lv_layer_top modal -- an opaque backdrop
+   * doesn't cull it -- so a heavy tab behind the keyboard OOM-hangs this 64KB
+   * pool (Settings' 4 shadowed cards froze the render; the WiFi tab rendered
+   * but left only ~4.3KB free, which then OOM'd idle within ~1s). The MQTT tab
+   * is LAZY: empty whenever it isn't being built, exactly the "empty tab
+   * behind the keyboard" condition that makes the broker modal stable. We
+   * switch there, suppress its lazy build while the modal is up (guarded in
+   * mqttReconcileView), and switch back on close -- all invisible behind the
+   * opaque backdrop below. */
+  autoReturnTab = lv_tabview_get_tab_active(tabview);
+  lv_tabview_set_active(tabview, 10, LV_ANIM_OFF);   /* 10 = MQTT (lazy/empty) */
+
+  lv_obj_set_style_bg_color(lv_layer_top(), lv_color_hex(0x0A0F1E), 0);
+  lv_obj_set_style_bg_opa(lv_layer_top(), LV_OPA_COVER, 0);
+  lv_obj_add_flag(lv_layer_top(), LV_OBJ_FLAG_CLICKABLE);
+
+  autoModal = lv_obj_create(lv_layer_top());
+  lv_obj_set_size(autoModal, 560, 380);
+  lv_obj_center(autoModal);
+  lv_obj_add_style(autoModal, &stCard, 0);
+  lv_obj_remove_flag(autoModal, LV_OBJ_FLAG_SCROLLABLE);
+
+  lv_obj_t *title = lv_label_create(autoModal);
+  lv_label_set_text(title, LV_SYMBOL_BELL "  Rule:  A0-A3  above/below  level  Rn  on/off");
+  lv_obj_add_style(title, &stCardTitle, 0);
+  lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 0);
+
+  autoTa = lv_textarea_create(autoModal);
+  lv_textarea_set_one_line(autoTa, true);
+  lv_textarea_set_placeholder_text(autoTa, "A0 above 512 R4 on");
+  { char spec[48]; autoRuleToSpec(spec, sizeof(spec)); lv_textarea_set_text(autoTa, spec); }
+  lv_obj_set_width(autoTa, 400);
+  lv_obj_align(autoTa, LV_ALIGN_TOP_MID, 0, 40);
+
+  autoKb = lv_keyboard_create(autoModal);
+  lv_obj_set_size(autoKb, 520, 230);
+  lv_obj_align(autoKb, LV_ALIGN_BOTTOM_MID, 0, 0);
+  lv_keyboard_set_textarea(autoKb, autoTa);
+  lv_obj_add_event_cb(autoKb, autoKbCb, LV_EVENT_ALL, NULL);
+  DBG("auto modal: open");
+}
+
+/* Deferred so the tab-switch + open run in loop(), not inside the Settings
+ * label's own event dispatch. */
+static void openAutoModalCb(lv_event_t *e) { (void)e; autoModalWant = true; }
+
 static void buildSettings(lv_obj_t *tab) {
   /* display card */
   lv_obj_t *c = makeCard(tab, 314, 150);
@@ -1586,7 +1780,9 @@ static void buildSettings(lv_obj_t *tab) {
   lv_obj_align(dd, LV_ALIGN_TOP_LEFT, 0, 40);
   lv_obj_add_event_cb(dd, sensorRateCb, LV_EVENT_VALUE_CHANGED, NULL);
 
-  /* system info card */
+  /* system info card -- also carries the Automation entry point as a single
+   * clickable label (a full card + button would cost too much permanent LVGL
+   * pool; the rule UI itself is a transient modal, opened from this label) */
   c = makeCard(tab, 314, 260);
   cardTitle(c, LV_SYMBOL_LIST, "System");
   sysInfoLbl = lv_label_create(c);
@@ -1596,6 +1792,13 @@ static void buildSettings(lv_obj_t *tab) {
   lv_obj_add_style(sysInfoLbl, &stMuted, 0);
   lv_obj_align(sysInfoLbl, LV_ALIGN_TOP_LEFT, 0, 30);
   lv_label_set_text(sysInfoLbl, "...");
+  autoLinkLbl = lv_label_create(c);
+  lv_label_set_text(autoLinkLbl, LV_SYMBOL_BELL "  Automation rule   (tap to set)");
+  lv_obj_set_style_text_color(autoLinkLbl, lv_color_hex(C_ACCENT), 0);
+  lv_obj_align(autoLinkLbl, LV_ALIGN_BOTTOM_LEFT, 0, -14);
+  lv_obj_add_flag(autoLinkLbl, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_set_ext_click_area(autoLinkLbl, 18);
+  lv_obj_add_event_cb(autoLinkLbl, openAutoModalCb, LV_EVENT_CLICKED, NULL);
 
   /* safety card */
   c = makeCard(tab, 314, 260);
@@ -2021,6 +2224,10 @@ static void mqttTabChangeCb(lv_event_t *e) {
 
 static void mqttReconcileView() {
   if (!mqttTabPage) return;
+  /* The automation modal parks itself on the MQTT tab precisely because it's
+   * empty; don't build it out from under the modal (it would defeat the
+   * headroom the empty tab provides). Resumes when the modal closes. */
+  if (autoModal) return;
 
   /* A modal was requested (Set-broker button or serial 'q'): free the tab
    * first so the keyboard has pool room, then open. Both here in loop(),
@@ -2162,6 +2369,15 @@ void setup() {
     requestConnect();               /* loop() connects a moment after boot */
   }
 
+  /* restore the saved automation rule (evaluated live in sensorTimerCb) */
+  autoEnabled   = kvLoadU8 ("/kv/auto_en",     0) ? true : false;
+  autoSensor    = kvLoadU8 ("/kv/auto_sensor", 0) & 3;
+  autoAbove     = kvLoadU8 ("/kv/auto_dir",    1);
+  autoRelay     = kvLoadU8 ("/kv/auto_relay",  0) & 3;
+  autoThreshold = kvLoadU16("/kv/auto_thr",    512);
+  if (autoThreshold > 1023) autoThreshold = 1023;
+  updateAutoLink();   /* show the restored rule on the Settings entry-point label */
+
   DBG("GIGA Control Panel ready");
 }
 
@@ -2271,7 +2487,17 @@ void loop() {
         lv_obj_send_event(mqttSw, LV_EVENT_VALUE_CHANGED, NULL);
       }
     }
+    else if (cmd == 'z') autoModalWant = true;    /* request the automation-rule modal (loop opens it) */
+    else if (cmd == 'Z') {                        /* type a test spec + submit, exercising the real
+                                                   * parse/commit/close path (A2 below 300 -> Relay 2 on) */
+      if (autoTa) lv_textarea_set_text(autoTa, "A2 below 300 R2 on");
+      if (autoKb) lv_obj_send_event(autoKb, LV_EVENT_READY, NULL);
+    }
   }
+
+  /* Open the automation modal from loop() too (serial 'z'); the touch path
+   * opens it directly from the Settings-label cb, like the Recon modal. */
+  if (autoModalWant) { autoModalWant = false; openAutoModal(); }
 
   if (scanPending    && --scanPending == 0)    { DBG("loop: scan start"); performScan(); DBG("loop: scan end"); }
   if (connectPending && --connectPending == 0) performConnect();
@@ -2287,6 +2513,7 @@ void loop() {
     closeReconModal();
     if (reconSubmitted) performReconScan();
   }
+  if (autoClosePending && --autoClosePending == 0) closeAutoModal();
   if (mqttClosePending && --mqttClosePending == 0) closeMqttModal();
   if (mqttConnectPending && --mqttConnectPending == 0) performMqttConnect();
   if (portalCheckPending && --portalCheckPending == 0) checkCaptivePortal();
