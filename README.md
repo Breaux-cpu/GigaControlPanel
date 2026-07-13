@@ -16,7 +16,7 @@ Shield** + **Arduino 4 Relays Shield**, built with LVGL 9.
 | **WiFi** | Scan networks, tap one, type the password on the on-screen keyboard, connect / disconnect; open networks connect directly. "Other network…" lets you type a hidden/out-of-range SSID by hand. After connecting, automatically checks for a captive portal (sign-in page) and flags it if found; shows a specific error if the connect attempt fails |
 | **BLE** | Toggle a BLE peripheral (`GIGA-Control`) that lets a phone control relays & motors and stream A0 |
 | **Settings** | Display brightness, sensor update rate, system info, safety notes |
-| **Recon** | TCP connect-scan of a user-entered target IP across 8 common ports. **For authorized security testing only** — see the Recon section below |
+| **Recon** | TCP connect-scan of a user-entered target IP across 8 common ports (or a custom port list), with a short scan-history strip. **For authorized security testing only** — see the Recon section below |
 
 ## Pin map
 
@@ -99,7 +99,9 @@ The WiFi tab's status line distinguishes:
 
 **Only scan hosts and networks you have explicit permission to test.** This is a standard TCP port scanner, the same category of tool as `nmap`, and carries the same expectation of authorized use.
 
-Tap "Set target & scan", type an IP address, submit — it TCP connect-scans 8 common ports (FTP 21, SSH 22, Telnet 23, HTTP 80, HTTPS 443, SMB 445, RDP 3389, HTTP-alt 8080) and lists each as open/closed. Results also print to serial (`recon: port <N> open/closed`) for an audit trail.
+Tap "Set target & scan", type an IP address, submit — it TCP connect-scans 8 common ports (FTP 21, SSH 22, Telnet 23, HTTP 80, HTTPS 443, SMB 445, RDP 3389, HTTP-alt 8080) and lists each as open/closed. Type a comma-separated port list after the IP (e.g. `192.168.1.1 22,80,8080`) to scan those instead — still capped at 8. Results also print to serial (`recon: port <N> open/closed`) for an audit trail. A strip above the results shows the last 3 scans (target + open/total count) for the current session — not persisted across a reboot.
+
+A banner-grab step (reading the open socket's greeting right after `connect()`) was tried and pulled back out — it caused a delayed watchdog reset, sometimes minutes after the scan had already completed and reported success. Root cause unconfirmed (suspected: the mbed WiFi stack's `connect()`/`read()`/`stop()` cycle leaves a pending async operation that later faults into freed state). Not shipped; see the git history if you want to pick this back up, and soak-test any revival for several idle minutes after a scan against an open port before trusting it.
 
 **What this device's WiFi hardware genuinely cannot do**: monitor mode, raw 802.11 frame access, packet injection. Checked `WiFi.h`/`WiFi.cpp` directly — the library only exposes station/AP mode via `WiFiClient`. This isn't a missing feature to add later; the Murata WiFi module + Arduino WiFi library don't expose that layer at all. (For that class of testing, jessy's onboard `ath10k_snoc` adapter *does* support monitor mode per `iw list` — see the security-toolkit notes on that device instead.)
 
@@ -154,6 +156,25 @@ Test with **nRF Connect** or **LightBlue** on your phone.
   during testing before this was understood). See the Recon section above
   for the actual fix (the watchdog is deliberately paused for the
   duration of a scan) and the real numbers observed.
+- **A modal that gets reopened for a second use needs its old, still-
+  resident widgets freed *before* the new one is created, not after.**
+  The Recon tab's target-IP modal reproducibly hung and watchdog-reset the
+  board on a *second* scan in the same session — not the first. Root
+  cause: the previous scan's 8 result rows are only freed when the *next*
+  scan starts, so reopening the modal for a second scan had to allocate a
+  fresh textarea + keyboard on top of a heap still holding the first
+  scan's full result list, and that allocation didn't fit in the
+  remaining contiguous space. The failure doesn't surface where it
+  happens — `openReconModal()` itself returns cleanly and logs its own
+  "modal: open" line — because LVGL v9 defers layout to the *next*
+  `lv_timer_handler()` pass, so the crash looked like a delayed, unrelated
+  hang until traced back. This was present in the original single-scan-
+  tested Recon tab commit too; it just took a second scan in one session
+  to expose it. Fix: free the old result list when the modal *opens*, not
+  when the next scan begins. If you add another list-plus-modal
+  combination anywhere in this file, free the list before creating the
+  modal, and soak-test at least two full cycles (not one) before trusting
+  it — a single successful use proves nothing about the second one.
 - **Closing the password modal must NOT happen synchronously from inside
   the keyboard's own event callback.** `kbCb` fires `LV_EVENT_READY` when
   the user taps the keyboard's checkmark. An earlier version of this code
