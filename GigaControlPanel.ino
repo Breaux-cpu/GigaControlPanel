@@ -22,6 +22,7 @@
  *   Arduino_BMI270_BMM150     latest  (shield IMU, on Wire1)
  *   Arduino_AdvancedAnalog    latest  (DAC tone on the audio jack)
  *   ArduinoBLE                latest
+ *   MQTT                      2.5.x   (256dpi/arduino-mqtt; MQTT remote tab)
  * (Arduino_H7_Video, WiFi and PDM ship with the "Arduino Mbed OS GIGA Boards" core.)
  *
  * Board: Tools > Board > Arduino Mbed OS GIGA Boards > Arduino GIGA R1 WiFi
@@ -37,6 +38,7 @@
 #include <Arduino_BMI270_BMM150.h>
 #include <PDM.h>
 #include <Arduino_AdvancedAnalog.h>
+#include <MQTTClient.h>             /* 256dpi/arduino-mqtt -- remote monitor + control over MQTT */
 #include "drivers/Watchdog.h"        /* hardware watchdog -- auto-recover from any future freeze */
 
 /* ================= hardware configuration ================= */
@@ -181,6 +183,47 @@ static lv_chart_series_t *micSer;
 static lv_obj_t *sysInfoLbl;
 static lv_timer_t *sensorTimer;
 
+/* ---- MQTT (remote monitor + control) ----
+ * All topics live under MQTT_PREFIX. The GIGA publishes its own state
+ * (relays / A0) and subscribes to a single command topic that mirrors the
+ * BLE relay characteristic exactly (a 0..15 bitmask). mqttNet is a plain
+ * WiFiClient, so mqttClient.connect() carries the same "connect() to an
+ * unreachable host isn't bounded by any timeout call on this core" caveat
+ * the Recon scan already documents -- performMqttConnect() pauses the
+ * watchdog around it for that reason, same as performReconScan(). */
+#define MQTT_PREFIX   "giga-control"
+#define MQTT_CLIENTID "giga-control-r1"
+static WiFiClient    mqttNet;
+static MQTTClient    mqttClient(256);
+static char          mqttHost[64] = "";
+static uint16_t      mqttPort     = 1883;
+static bool          mqttEnabled  = false;   /* user wants a connection (drives auto-reconnect) */
+static volatile bool mqttRelaysDirty = false;/* a relay changed -- republish on the next loop() */
+static uint16_t      mqttConnectPending = 0; /* loop() runs the (possibly-blocking) connect */
+static uint8_t       mqttClosePending   = 0;
+static bool          mqttSubmitted      = false;
+static lv_obj_t *mqttModal = NULL, *mqttTa, *mqttKb;
+static lv_obj_t *mqttStatusLbl, *mqttBrokerLbl, *mqttActivityLbl, *mqttSw;
+/* The MQTT tab is built LAZILY -- its widgets exist only while the tab is
+ * actually on screen, then are freed on leaving it. This 11th tab's
+ * permanent widgets (~1.7KB of LVGL pool) don't fit alongside the boot-time
+ * WiFi/captive-portal allocations on the already-maxed 64KB pool (proven:
+ * a permanent version boot-looped via OOM). Transient widgets, like a
+ * modal, are fine even at the low free the tab causes -- and at boot/idle
+ * the page is empty, so idle free stays at the stable ~6.8KB. loop()
+ * reconciles built-state against the active tab, outside any LVGL event
+ * dispatch (same safety rule as every other deferred action here). */
+static lv_obj_t *mqttTabPage  = NULL;
+static bool      mqttViewBuilt = false;
+/* The broker keyboard modal (~2.2KB) and the built tab (~1.6KB) don't fit
+ * together in the pool, so opening the modal first frees the tab (which the
+ * modal covers anyway). Both actions are deferred to loop() via these flags
+ * so the tab -- which holds the very button whose click requests the modal
+ * -- is never deleted from inside its own event callback (the delete-in-
+ * callback hazard that hard-froze this board twice before). */
+static volatile bool mqttModalWant = false;
+static bool          mqttModalOpen = false;
+
 /* styles */
 static lv_style_t stCard, stCardTitle, stMuted, stBig;
 
@@ -221,6 +264,7 @@ static void applyRelay(int i, bool on) {
   setDot(dashDot[i], on);
   if (on) lv_obj_add_state(relaySw[i], LV_STATE_CHECKED);
   else    lv_obj_remove_state(relaySw[i], LV_STATE_CHECKED);
+  mqttRelaysDirty = true;   /* republished on the next loop() if MQTT is connected */
 }
 
 static void applyMotor(int i) {
@@ -1101,6 +1145,17 @@ static void statusTimerCb(lv_timer_t *t) {
    * Always runs regardless of active tab -- a phone can be subscribed no
    * matter what's on screen. */
   if (bleEnabled && BLE.central()) sensorChar.writeValue((uint16_t)lastA0);
+
+  /* Stream A0 to MQTT subscribers too (~1 Hz, this timer's own cadence).
+   * Same always-runs rationale as the BLE stream: a remote subscriber is
+   * independent of which tab is on screen. Publishing from a timer callback
+   * (inside lv_timer_handler, inside loop()) is the same safe context the
+   * BLE writeValue above already uses -- not an LVGL event dispatch. */
+  if (mqttEnabled && mqttClient.connected()) {
+    char b[8];
+    snprintf(b, sizeof(b), "%d", lastA0);
+    mqttClient.publish(MQTT_PREFIX "/sensor/a0", b);
+  }
 }
 
 /* ================= theme / styles ================= */
@@ -1598,6 +1653,332 @@ static void buildRecon(lv_obj_t *tab) {
   lv_obj_add_style(note, &stMuted, 0);
 }
 
+/* ================= MQTT (remote monitor + control) ================= */
+
+static void mqttSetStatus(const char *txt, uint32_t color) {
+  if (!mqttStatusLbl) return;
+  lv_label_set_text(mqttStatusLbl, txt);
+  lv_obj_set_style_text_color(mqttStatusLbl, lv_color_hex(color), 0);
+}
+
+static void mqttSetActivity(const char *txt) {
+  if (mqttActivityLbl) lv_label_set_text(mqttActivityLbl, txt);
+}
+
+static void mqttUpdateBrokerLbl() {
+  if (!mqttBrokerLbl) return;
+  if (mqttHost[0]) lv_label_set_text_fmt(mqttBrokerLbl, LV_SYMBOL_UPLOAD "  Broker: %s:%u", mqttHost, mqttPort);
+  else             lv_label_set_text(mqttBrokerLbl, LV_SYMBOL_UPLOAD "  No broker set -- tap \"Set broker\"");
+}
+
+/* Publish the 4 relays as one retained 0..15 bitmask -- same encoding as
+ * the BLE relay characteristic, so a remote controller speaks one language
+ * over either transport. Retained so a subscriber that connects later
+ * immediately learns the current state. */
+static void mqttPublishRelays() {
+  char buf[4];
+  int m = 0;
+  for (int i = 0; i < 4; i++) if (relayState[i]) m |= (1 << i);
+  snprintf(buf, sizeof(buf), "%d", m);
+  mqttClient.publish(MQTT_PREFIX "/relays", buf, true, 0);
+}
+
+/* Incoming command handler. Runs from mqttClient.loop(), which we call from
+ * our own loop() -- so this is NOT inside an LVGL event dispatch, and
+ * touching widgets here is safe, exactly like blePoll() updating switches
+ * from loop() context (the file's established rule). */
+static void mqttOnMessage(String &topic, String &payload) {
+  if (topic == MQTT_PREFIX "/relay/set") {
+    int m = payload.toInt();                 /* 0..15 bitmask, mirrors relayChar */
+    for (int i = 0; i < 4; i++) applyRelay(i, m & (1 << i));   /* applyRelay syncs dots+switches */
+    if (bleReady) relayChar.writeValue((relayState[0] << 0) | (relayState[1] << 1) |
+                                       (relayState[2] << 2) | (relayState[3] << 3));
+    mqttSetActivity(LV_SYMBOL_DOWNLOAD "  rx relay/set");
+    /* applyRelay set mqttRelaysDirty; loop() will echo the new state back. */
+  }
+}
+
+/* Blocking on an unreachable broker (the WiFiClient TCP connect phase, not
+ * bounded by mqttClient.setTimeout() -- same core limitation the Recon scan
+ * documents), so the watchdog is paused around the connect exactly like
+ * performReconScan(). Always run from loop() via mqttConnectPending, never
+ * from an LVGL callback. */
+static void performMqttConnect() {
+  if (mqttHost[0] == '\0') {
+    mqttSetStatus(LV_SYMBOL_WARNING "  No broker set", C_WARN);
+    mqttEnabled = false;
+    if (mqttSw) lv_obj_remove_state(mqttSw, LV_STATE_CHECKED);
+    return;
+  }
+  if (WiFi.status() != WL_CONNECTED) {
+    mqttSetStatus(LV_SYMBOL_WARNING "  WiFi offline -- connect WiFi first", C_WARN);
+    mqttEnabled = false;
+    if (mqttSw) lv_obj_remove_state(mqttSw, LV_STATE_CHECKED);
+    return;
+  }
+
+  if (mqttStatusLbl) {   /* NULL whenever the (lazy) MQTT tab isn't currently on screen */
+    lv_label_set_text_fmt(mqttStatusLbl, LV_SYMBOL_REFRESH "  Connecting to %s:%u ...", mqttHost, mqttPort);
+    lv_obj_set_style_text_color(mqttStatusLbl, lv_color_hex(C_WARN), 0);
+  }
+  DBG("mqtt: connecting");
+
+  mbed::Watchdog &watchdog = mbed::Watchdog::get_instance();
+  watchdog.stop();
+
+  mqttClient.begin(mqttHost, mqttPort, mqttNet);
+  mqttClient.setOptions(30 /*keepAlive s*/, true /*cleanSession*/, 3000 /*timeout ms*/);
+  mqttClient.onMessage(mqttOnMessage);
+  mqttClient.setWill(MQTT_PREFIX "/status", "offline", true, 0);   /* LWT: broker announces our drop */
+
+  char user[64] = "", pass[64] = "";
+  bool haveUser = kvLoadStr("/kv/mqtt_user", user, sizeof(user));
+  bool havePass = kvLoadStr("/kv/mqtt_pass", pass, sizeof(pass));
+  bool ok = haveUser ? (havePass ? mqttClient.connect(MQTT_CLIENTID, user, pass)
+                                  : mqttClient.connect(MQTT_CLIENTID, user))
+                     : mqttClient.connect(MQTT_CLIENTID);
+
+  watchdog.start(wdTimeout);
+  wdKick();
+
+  if (ok) {
+    mqttClient.publish(MQTT_PREFIX "/status", "online", true, 0);
+    mqttClient.subscribe(MQTT_PREFIX "/relay/set");
+    mqttPublishRelays();
+    if (mqttStatusLbl) {
+      lv_label_set_text_fmt(mqttStatusLbl, LV_SYMBOL_OK "  Connected to %s:%u", mqttHost, mqttPort);
+      lv_obj_set_style_text_color(mqttStatusLbl, lv_color_hex(C_OK), 0);
+    }
+    if (mqttSw) lv_obj_add_state(mqttSw, LV_STATE_CHECKED);
+    mqttSetActivity("subscribed " MQTT_PREFIX "/relay/set");
+    DBG("mqtt: connected");
+  } else {
+    mqttSetStatus(LV_SYMBOL_CLOSE "  Connect failed -- check broker/WiFi", C_DANGER);
+    if (mqttSw) lv_obj_remove_state(mqttSw, LV_STATE_CHECKED);
+    DBG("mqtt: connect failed");
+    /* leave mqttEnabled as-is: if the user asked to be connected, loop()
+     * will retry on a slow cadence; the switch reflects the live state. */
+  }
+}
+
+static void mqttDisconnect() {
+  if (mqttClient.connected()) {
+    mqttClient.publish(MQTT_PREFIX "/status", "offline", true, 0);
+    mqttClient.disconnect();
+  }
+  mqttEnabled = false;
+  mqttConnectPending = 0;
+  mqttSetStatus(LV_SYMBOL_BLUETOOTH "  Disconnected", C_MUTED);
+  mqttSetActivity("--");
+}
+
+static void mqttSwCb(lv_event_t *e) {
+  bool on = lv_obj_has_state((lv_obj_t *)lv_event_get_target(e), LV_STATE_CHECKED);
+  if (on) {
+    if (mqttHost[0] == '\0') {
+      lv_obj_remove_state(mqttSw, LV_STATE_CHECKED);
+      mqttSetStatus(LV_SYMBOL_WARNING "  Set a broker first", C_WARN);
+      return;
+    }
+    mqttEnabled = true;
+    mqttConnectPending = 5;              /* loop() runs the blocking connect a few frames later */
+    mqttSetStatus(LV_SYMBOL_REFRESH "  Connecting ...", C_WARN);
+  } else {
+    mqttDisconnect();
+  }
+  kvSaveU8("/kv/mqtt_on", mqttEnabled ? 1 : 0);
+}
+
+/* Broker-entry modal -- exact clone of the Recon/SSID/password deferred-
+ * close pattern: mqttKbCb only captures text and arms a countdown, loop()
+ * does the delete outside any LVGL event dispatch. No residual widget list
+ * to free here (unlike the Recon modal), so no clean-on-open needed. */
+static void closeMqttModal() {
+  if (mqttModal) { lv_obj_delete(mqttModal); mqttModal = NULL; }
+  lv_obj_set_style_bg_opa(lv_layer_top(), LV_OPA_TRANSP, 0);
+  lv_obj_remove_flag(lv_layer_top(), LV_OBJ_FLAG_CLICKABLE);
+  mqttModalOpen = false;   /* loop()'s reconcile rebuilds the tab view next iteration */
+}
+
+/* Accepts "host" or "host:port" in the single field; defaults to 1883.
+ * Stores the raw string in KVStore (port is 16-bit, so it rides along in
+ * the string rather than needing its own typed key). */
+static void parseMqttBroker(const char *raw) {
+  char buf[80];
+  strlcpy(buf, raw, sizeof(buf));
+  /* trim leading/trailing spaces the on-screen keyboard makes easy to add */
+  char *s = buf;
+  while (*s == ' ') s++;
+  char *end = s + strlen(s);
+  while (end > s && end[-1] == ' ') *--end = '\0';
+
+  char *colon = strrchr(s, ':');
+  uint16_t port = 1883;
+  if (colon) {
+    long p = strtol(colon + 1, NULL, 10);
+    if (p > 0 && p <= 65535) { port = (uint16_t)p; *colon = '\0'; }
+  }
+  strlcpy(mqttHost, s, sizeof(mqttHost));
+  mqttPort = port;
+  kvSaveStr("/kv/mqtt_broker", raw);
+  mqttUpdateBrokerLbl();
+}
+
+static void mqttKbCb(lv_event_t *e) {
+  lv_event_code_t code = lv_event_get_code(e);
+  if (code == LV_EVENT_READY) {
+    parseMqttBroker(lv_textarea_get_text(mqttTa));
+    mqttSubmitted = true;
+    mqttClosePending = 5;
+  } else if (code == LV_EVENT_CANCEL) {
+    mqttSubmitted = false;
+    mqttClosePending = 5;
+  }
+}
+
+static void openMqttModal() {
+  lv_obj_set_style_bg_color(lv_layer_top(), lv_color_hex(0x000000), 0);
+  lv_obj_set_style_bg_opa(lv_layer_top(), LV_OPA_50, 0);
+  lv_obj_add_flag(lv_layer_top(), LV_OBJ_FLAG_CLICKABLE);
+
+  mqttModal = lv_obj_create(lv_layer_top());
+  lv_obj_set_size(mqttModal, 560, 380);
+  lv_obj_center(mqttModal);
+  lv_obj_add_style(mqttModal, &stCard, 0);
+  lv_obj_remove_flag(mqttModal, LV_OBJ_FLAG_SCROLLABLE);
+
+  lv_obj_t *title = lv_label_create(mqttModal);
+  lv_label_set_text(title, LV_SYMBOL_UPLOAD "  Broker host, optionally :port");
+  lv_obj_add_style(title, &stCardTitle, 0);
+  lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 0);
+
+  mqttTa = lv_textarea_create(mqttModal);
+  lv_textarea_set_one_line(mqttTa, true);
+  lv_textarea_set_placeholder_text(mqttTa, "192.168.1.10:1883");
+  if (mqttHost[0]) lv_textarea_set_text(mqttTa, mqttHost);
+  lv_obj_set_width(mqttTa, 400);
+  lv_obj_align(mqttTa, LV_ALIGN_TOP_MID, 0, 40);
+
+  mqttKb = lv_keyboard_create(mqttModal);
+  lv_obj_set_size(mqttKb, 520, 230);
+  lv_obj_align(mqttKb, LV_ALIGN_BOTTOM_MID, 0, 0);
+  lv_keyboard_set_textarea(mqttKb, mqttTa);
+  lv_obj_add_event_cb(mqttKb, mqttKbCb, LV_EVENT_ALL, NULL);
+  mqttModalOpen = true;
+  DBG("mqtt modal: open");
+}
+
+/* Only *requests* the modal -- loop() frees the tab and opens it, so the tab
+ * (containing this very button) is never deleted inside its own callback. */
+static void openMqttModalCb(lv_event_t *e) { (void)e; mqttModalWant = true; }
+
+/* Reflect the live engine state onto the (possibly just-rebuilt) view. */
+static void mqttRefreshView() {
+  if (!mqttStatusLbl) return;
+  if (mqttEnabled && mqttClient.connected()) {
+    lv_label_set_text_fmt(mqttStatusLbl, LV_SYMBOL_OK "  Connected to %s:%u", mqttHost, mqttPort);
+    lv_obj_set_style_text_color(mqttStatusLbl, lv_color_hex(C_OK), 0);
+  } else if (mqttEnabled) {
+    lv_label_set_text(mqttStatusLbl, LV_SYMBOL_REFRESH "  Connecting ...");
+    lv_obj_set_style_text_color(mqttStatusLbl, lv_color_hex(C_WARN), 0);
+  } else {
+    lv_label_set_text(mqttStatusLbl, LV_SYMBOL_BLUETOOTH "  Disconnected");
+    lv_obj_set_style_text_color(mqttStatusLbl, lv_color_hex(C_MUTED), 0);
+  }
+  if (mqttSw) {
+    if (mqttEnabled) lv_obj_add_state(mqttSw, LV_STATE_CHECKED);
+    else             lv_obj_remove_state(mqttSw, LV_STATE_CHECKED);
+  }
+}
+
+/* Builds the MQTT tab's widgets INTO an already-visible page. Called lazily
+ * from loop() when the user switches to the tab (never at boot), and the
+ * widgets are freed again on leaving -- see the mqttViewBuilt note above for
+ * why this tab can't be permanent. Deliberately card-less and frugal (five
+ * plain widgets, no shadowed cards, topic reference kept in the README) so
+ * the transient footprint stays modest even so. */
+static void buildMqttContent(lv_obj_t *page) {
+  lv_obj_t *title = lv_label_create(page);
+  lv_label_set_text(title, LV_SYMBOL_UPLOAD "  MQTT remote");
+  lv_obj_add_style(title, &stCardTitle, 0);
+  lv_obj_set_width(title, LV_PCT(100));   /* full-width -> next items wrap to their own rows */
+
+  mqttStatusLbl = lv_label_create(page);
+  lv_obj_add_style(mqttStatusLbl, &stMuted, 0);
+  lv_obj_set_width(mqttStatusLbl, LV_PCT(100));
+
+  mqttBrokerLbl = lv_label_create(page);
+  lv_obj_set_width(mqttBrokerLbl, LV_PCT(100));
+  lv_label_set_long_mode(mqttBrokerLbl, LV_LABEL_LONG_MODE_DOTS);
+  lv_obj_add_style(mqttBrokerLbl, &stMuted, 0);
+  mqttUpdateBrokerLbl();
+
+  lv_obj_t *setBtn = lv_button_create(page);
+  lv_obj_set_size(setBtn, 180, 46);
+  lv_obj_set_style_bg_color(setBtn, lv_color_hex(0x1B2A4A), 0);
+  lv_obj_add_event_cb(setBtn, openMqttModalCb, LV_EVENT_CLICKED, NULL);
+  lv_obj_t *sbl = lv_label_create(setBtn);
+  lv_label_set_text(sbl, LV_SYMBOL_UPLOAD " Set broker");
+  lv_obj_center(sbl);
+
+  mqttSw = lv_switch_create(page);
+  lv_obj_set_size(mqttSw, 72, 36);
+  lv_obj_set_style_bg_color(mqttSw, lv_color_hex(C_ACCENT), LV_PART_INDICATOR | LV_STATE_CHECKED);
+  lv_obj_add_event_cb(mqttSw, mqttSwCb, LV_EVENT_VALUE_CHANGED, NULL);
+
+  mqttRefreshView();   /* show current connection state, not a stale default */
+  /* mqttActivityLbl left NULL -- mqttSetActivity() is NULL-safe. */
+}
+
+/* Lazy stub: remember the page, build nothing now (boot stays on the
+ * dashboard, so the MQTT page must cost zero pool at boot). */
+static void buildMqtt(lv_obj_t *tab) {
+  mqttTabPage = tab;
+}
+
+/* Reconciled from loop(), never an event callback: build the tab's widgets
+ * when it becomes active, free them when it stops being active. Freeing on
+ * leave is what keeps idle/boot free at the stable ~6.8KB. */
+static void mqttFreeView() {
+  if (!mqttViewBuilt) return;
+  lv_obj_clean(mqttTabPage);
+  mqttStatusLbl = mqttBrokerLbl = mqttSw = NULL;
+  mqttViewBuilt = false;
+}
+
+/* Free the MQTT tab the instant the active tab changes AWAY from it --
+ * fired from the tabview's own change event, which runs before LVGL renders
+ * the newly-active tab. Doing it here (rather than one loop() later in
+ * mqttReconcileView) matters when connected: the connection leaves only
+ * ~4.5KB free while viewing this tab, and the incoming tab's render
+ * transient would OOM if the MQTT widgets were still allocated alongside it.
+ * We only delete mqttTabPage's children (not the tabview whose callback this
+ * is), so this isn't the delete-in-own-callback hazard. */
+static void mqttTabChangeCb(lv_event_t *e) {
+  (void)e;
+  if (mqttModalOpen) return;
+  if (lv_tabview_get_tab_active(tabview) != 10 && mqttViewBuilt) mqttFreeView();
+}
+
+static void mqttReconcileView() {
+  if (!mqttTabPage) return;
+
+  /* A modal was requested (Set-broker button or serial 'q'): free the tab
+   * first so the keyboard has pool room, then open. Both here in loop(),
+   * never inside the button's own callback. */
+  if (mqttModalWant) {
+    mqttModalWant = false;
+    if (!mqttModalOpen) { mqttFreeView(); openMqttModal(); }
+  }
+  if (mqttModalOpen) return;   /* leave the tab empty behind the modal */
+
+  /* Build on arrival. Freeing on leave is handled early by mqttTabChangeCb;
+   * this also frees as a backstop in case the event was ever missed. */
+  bool onTab = (lv_tabview_get_tab_active(tabview) == 10);
+  if (onTab && !mqttViewBuilt)  { buildMqttContent(mqttTabPage); mqttViewBuilt = true; }
+  else if (!onTab && mqttViewBuilt) mqttFreeView();
+}
+
 /* ================= setup / loop ================= */
 
 void setup() {
@@ -1661,9 +2042,13 @@ void setup() {
    * audioTimerCb's tab-gating and the serial commands below) stays exactly
    * as it was -- no risk of an off-by-one from renumbering. */
   lv_obj_t *tRecon = lv_tabview_add_tab(tabview, LV_SYMBOL_GPS);
+  /* MQTT appended last (index 10), same reasoning as Recon -- appending
+   * never renumbers an existing tab, so all the tab-index checks in the
+   * timers and serial commands stay valid. */
+  lv_obj_t *tMqtt = lv_tabview_add_tab(tabview, LV_SYMBOL_UPLOAD);
   styleTab(tDash); styleTab(tRel); styleTab(tMot); styleTab(tSen);
   styleTab(tImu);  styleTab(tAud); styleTab(tWifi); styleTab(tBle); styleTab(tSet);
-  styleTab(tRecon);
+  styleTab(tRecon); styleTab(tMqtt);
 
   /* style the tab bar buttons (v9: real buttons inside the bar) */
   lv_obj_t *tb = lv_tabview_get_tab_bar(tabview);
@@ -1690,6 +2075,14 @@ void setup() {
   buildBluetooth(tBle);
   buildSettings(tSet);
   buildRecon(tRecon);
+  buildMqtt(tMqtt);
+  lv_obj_add_event_cb(tabview, mqttTabChangeCb, LV_EVENT_VALUE_CHANGED, NULL);   /* free MQTT tab early on leave */
+
+  /* Restore a saved broker address so it's shown/prefilled, but do NOT
+   * auto-connect at boot: a blocking connect() to an unreachable broker
+   * would stall the UI coming up (and WiFi may not be associated yet). The
+   * user toggles the connect switch when they want it. */
+  { char b[80]; if (kvLoadStr("/kv/mqtt_broker", b, sizeof(b))) parseMqttBroker(b); }
 
   updateWifiStatus();
   static const uint16_t rates[] = { 100, 300, 1000 };
@@ -1716,7 +2109,24 @@ void setup() {
 void loop() {
   wdKick();
   lv_timer_handler();
+  mqttReconcileView();     /* build the MQTT tab's widgets only while it's on screen */
   if (bleEnabled) blePoll();
+
+  /* MQTT servicing: loop() keepalive + inbound messages when connected,
+   * republish relays when they've changed, and a slow auto-reconnect if the
+   * link drops while the user still wants it. mqttClient.loop() is non-
+   * blocking when the socket is healthy; a dropped socket is caught by the
+   * per-loop() watchdog kick either way. The reconnect itself is deferred
+   * through mqttConnectPending (watchdog-paused in performMqttConnect). */
+  if (mqttEnabled) {
+    mqttClient.loop();
+    if (mqttClient.connected()) {
+      if (mqttRelaysDirty) { mqttPublishRelays(); mqttRelaysDirty = false; }
+    } else if (mqttConnectPending == 0) {
+      mqttSetStatus(LV_SYMBOL_REFRESH "  Reconnecting ...", C_WARN);
+      mqttConnectPending = 750;            /* ~3s at 4ms/loop between attempts */
+    }
+  }
 
   /* keep the DAC fed while a tone plays */
   if (toneOn && dac0.available()) {
@@ -1781,6 +2191,23 @@ void loop() {
       if (reconTa) lv_textarea_set_text(reconTa, "192.0.2.1");
       if (reconKb) lv_obj_send_event(reconKb, LV_EVENT_READY, NULL);
     }
+    else if (cmd == 'M') {                        /* jump to the MQTT tab (index 10, past the 1-9/0 range) */
+      lv_tabview_set_active(tabview, 10, LV_ANIM_OFF);
+      if (Serial) { Serial.print("tab set "); Serial.println(10); }
+    }
+    else if (cmd == 'q') mqttModalWant = true;    /* request the broker-entry modal (loop opens it) */
+    else if (cmd == 'Q') {                        /* set a broker + submit (public test broker as the
+                                                   * example; use a LAN broker IP by hand for a full test) */
+      if (mqttTa) lv_textarea_set_text(mqttTa, "test.mosquitto.org:1883");
+      if (mqttKb) lv_obj_send_event(mqttKb, LV_EVENT_READY, NULL);
+    }
+    else if (cmd == 'v') {                        /* toggle the MQTT connect switch (connect/disconnect) */
+      if (mqttSw) {
+        if (lv_obj_has_state(mqttSw, LV_STATE_CHECKED)) lv_obj_remove_state(mqttSw, LV_STATE_CHECKED);
+        else lv_obj_add_state(mqttSw, LV_STATE_CHECKED);
+        lv_obj_send_event(mqttSw, LV_EVENT_VALUE_CHANGED, NULL);
+      }
+    }
   }
 
   if (scanPending    && --scanPending == 0)    { DBG("loop: scan start"); performScan(); DBG("loop: scan end"); }
@@ -1797,6 +2224,8 @@ void loop() {
     closeReconModal();
     if (reconSubmitted) performReconScan();
   }
+  if (mqttClosePending && --mqttClosePending == 0) closeMqttModal();
+  if (mqttConnectPending && --mqttConnectPending == 0) performMqttConnect();
   if (portalCheckPending && --portalCheckPending == 0) checkCaptivePortal();
   delay(4);
 }
