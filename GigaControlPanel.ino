@@ -171,8 +171,10 @@ static lv_obj_t *bleStatusLbl, *bleSw;
 static lv_obj_t *pwModal = NULL, *pwTa, *pwTitle, *pwKb;
 static lv_obj_t *ssidModal = NULL, *ssidTa, *ssidKb;
 static lv_obj_t *reconModal = NULL, *reconTa, *reconKb;
-static lv_obj_t *reconList, *reconStatusLbl;
+static lv_obj_t *reconList, *reconStatusLbl, *reconHistLbl;
 static char     targetIp[40] = "";
+static uint16_t reconPorts[8];      /* capped at 8, same proven-safe limit as the port list below */
+static int      reconPortCount = 0;
 static lv_obj_t *accBar[3], *gyroBar[3], *accLbl, *gyroLbl, *imuStatusLbl;
 static lv_obj_t *micBar, *micLbl, *micChart, *toneFreqLbl;
 static lv_chart_series_t *micSer;
@@ -624,10 +626,38 @@ static void closeReconModal() {
   lv_obj_remove_flag(lv_layer_top(), LV_OBJ_FLAG_CLICKABLE);
 }
 
+/* Accepts "<ip>" or "<ip> <port,port,...>" (space-separated) in the single
+ * text field -- a second textarea would need the keyboard to switch focus
+ * between two fields, a new interaction pattern this session hasn't proven
+ * safe yet, so this reuses the existing single-field modal completely
+ * unchanged instead. Falls back to the default COMMON_PORTS list when no
+ * ports are typed. Always capped at 8 (see COMMON_PORTS' own comment for
+ * why that specific number, not a rounder one). */
+static void parseReconInput(const char *raw) {
+  char buf[80];
+  strlcpy(buf, raw, sizeof(buf));
+  char *space = strchr(buf, ' ');
+  if (space) *space = '\0';
+  strlcpy(targetIp, buf, sizeof(targetIp));
+
+  reconPortCount = 0;
+  if (space) {
+    char *tok = strtok(space + 1, ",");
+    while (tok && reconPortCount < 8) {
+      long p = strtol(tok, NULL, 10);
+      if (p > 0 && p <= 65535) reconPorts[reconPortCount++] = (uint16_t)p;
+      tok = strtok(NULL, ",");
+    }
+  }
+  if (reconPortCount == 0) {
+    for (size_t i = 0; i < NUM_COMMON_PORTS && i < 8; i++) reconPorts[reconPortCount++] = COMMON_PORTS[i];
+  }
+}
+
 static void reconKbCb(lv_event_t *e) {
   lv_event_code_t code = lv_event_get_code(e);
   if (code == LV_EVENT_READY) {
-    strlcpy(targetIp, lv_textarea_get_text(reconTa), sizeof(targetIp));
+    parseReconInput(lv_textarea_get_text(reconTa));
     reconSubmitted = true;
     reconClosePending = 5;
   } else if (code == LV_EVENT_CANCEL) {
@@ -636,7 +666,21 @@ static void reconKbCb(lv_event_t *e) {
   }
 }
 
+/* Frees the previous scan's result rows (if any) before creating the modal
+ * below, not after -- reproducibly starved the modal's own allocation
+ * (textarea + keyboard) of contiguous heap on a *second* scan otherwise:
+ * a full 8-row result list plus a freshly-created modal don't fit
+ * together in this pool at the same time, and the failure doesn't surface
+ * where it happens (LVGL v9 defers layout, so it faults on the *next*
+ * lv_timer_handler() pass, well after openReconModal() itself returns
+ * cleanly) -- confirmed by bisecting against the already-committed v1
+ * Recon tab, which has the exact same bug, just never exercised by a
+ * second scan in one session before. Old results disappearing the moment
+ * the user reopens the modal to type a new target is the acceptable
+ * trade-off, not a regression -- they're about to be replaced anyway. */
 static void openReconModal() {
+  if (reconList) lv_obj_clean(reconList);
+
   lv_obj_set_style_bg_color(lv_layer_top(), lv_color_hex(0x000000), 0);
   lv_obj_set_style_bg_opa(lv_layer_top(), LV_OPA_50, 0);
   lv_obj_add_flag(lv_layer_top(), LV_OBJ_FLAG_CLICKABLE);
@@ -648,13 +692,13 @@ static void openReconModal() {
   lv_obj_remove_flag(reconModal, LV_OBJ_FLAG_SCROLLABLE);
 
   lv_obj_t *title = lv_label_create(reconModal);
-  lv_label_set_text(title, LV_SYMBOL_GPS "  Enter target IP address");
+  lv_label_set_text(title, LV_SYMBOL_GPS "  Target IP, optionally + ports");
   lv_obj_add_style(title, &stCardTitle, 0);
   lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 0);
 
   reconTa = lv_textarea_create(reconModal);
   lv_textarea_set_one_line(reconTa, true);
-  lv_textarea_set_placeholder_text(reconTa, "192.168.1.1");
+  lv_textarea_set_placeholder_text(reconTa, "192.168.1.1 22,80,443");
   lv_obj_set_width(reconTa, 400);
   lv_obj_align(reconTa, LV_ALIGN_TOP_MID, 0, 40);
 
@@ -683,6 +727,58 @@ static void openReconModalCb(lv_event_t *e) { (void)e; openReconModal(); }
  * this one bounded, user-initiated operation (TCP connect attempts always
  * eventually give up on their own; this just isn't a hang the watchdog
  * needs to catch) and resumed immediately after. */
+/* A banner-grab step (read the open socket's greeting after connect())
+ * was tried here and pulled back out: it reproducibly caused the board to
+ * hang and watchdog-reset several seconds to minutes *after* the scan had
+ * already completed and reported success -- including once with zero
+ * further activity in between, ruling out a simple re-entrancy bug in the
+ * scan loop itself. Root cause not confirmed (suspected: the mbed WiFi
+ * stack's connect()/read()/stop() cycle leaves a pending async operation
+ * that later fires into freed state), but the delayed, non-deterministic
+ * nature makes it unsafe to ship. If this is revisited, test it in
+ * isolation for a long soak (many minutes idle after a scan with an open
+ * port) before trusting it again. */
+
+/* Scan history: last 3 scans' target + open/total summary. Deliberately
+ * plain C arrays, not LVGL objects -- this data lives in ordinary global
+ * RAM, completely separate from the 64KB LVGL pool that's already the
+ * tightest resource on this board (4372 bytes free was the observed floor
+ * for a single 8-port scan). Displayed via ONE label updated in place
+ * (reconHistLbl, created once in buildRecon()), never new per-entry
+ * widgets -- that's what capped the result list itself at 8 rows earlier. */
+#define RECON_HISTORY_SIZE 3
+static char reconHistTarget[RECON_HISTORY_SIZE][40];
+static int  reconHistOpen[RECON_HISTORY_SIZE];
+static int  reconHistTotal[RECON_HISTORY_SIZE];
+static int  reconHistCount = 0;   /* how many slots are populated, <= RECON_HISTORY_SIZE */
+static int  reconHistNext  = 0;   /* ring-buffer write position */
+
+static void recordReconHistory(const char *target, int openCount, int total) {
+  strlcpy(reconHistTarget[reconHistNext], target, sizeof(reconHistTarget[0]));
+  reconHistOpen[reconHistNext] = openCount;
+  reconHistTotal[reconHistNext] = total;
+  reconHistNext = (reconHistNext + 1) % RECON_HISTORY_SIZE;
+  if (reconHistCount < RECON_HISTORY_SIZE) reconHistCount++;
+}
+
+static void updateReconHistoryLabel() {
+  if (reconHistCount == 0) {
+    lv_label_set_text(reconHistLbl, "No scans yet this session");
+    return;
+  }
+  char buf[160];
+  size_t pos = 0;
+  buf[0] = '\0';
+  for (int i = 0; i < reconHistCount; i++) {
+    int idx = (reconHistNext - 1 - i + RECON_HISTORY_SIZE) % RECON_HISTORY_SIZE;  /* most recent first */
+    int n = snprintf(buf + pos, sizeof(buf) - pos, "%s%s (%d/%d)",
+                      i ? "   |   " : "", reconHistTarget[idx], reconHistOpen[idx], reconHistTotal[idx]);
+    if (n < 0 || (size_t)n >= sizeof(buf) - pos) break;
+    pos += n;
+  }
+  lv_label_set_text(reconHistLbl, buf);
+}
+
 static void performReconScan() {
   DBG("recon: scan begin");
   mbed::Watchdog &watchdog = mbed::Watchdog::get_instance();
@@ -702,12 +798,15 @@ static void performReconScan() {
   }
 
   int openCount = 0;
-  for (size_t i = 0; reconList && i < NUM_COMMON_PORTS; i++) {
+  for (int i = 0; reconList && i < reconPortCount; i++) {
     WiFiClient client;
-    bool open = client.connect(target, COMMON_PORTS[i]);
-    if (open) { client.stop(); openCount++; }
+    bool open = client.connect(target, reconPorts[i]);
+    if (open) {
+      client.stop();
+      openCount++;
+    }
     if (Serial) {   /* audit-trail log, not just a debug aid, for a security tool */
-      Serial.print("recon: port "); Serial.print(COMMON_PORTS[i]);
+      Serial.print("recon: port "); Serial.print(reconPorts[i]);
       Serial.println(open ? " open" : " closed");
     }
 
@@ -719,7 +818,7 @@ static void performReconScan() {
     lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_t *lbl = lv_label_create(row);
     lv_label_set_text_fmt(lbl, "%s   port %-5u  %s",
-        open ? LV_SYMBOL_OK : LV_SYMBOL_CLOSE, COMMON_PORTS[i], open ? "open" : "closed");
+        open ? LV_SYMBOL_OK : LV_SYMBOL_CLOSE, reconPorts[i], open ? "open" : "closed");
     lv_obj_set_style_text_color(lbl, lv_color_hex(open ? C_OK : C_MUTED), 0);
     lv_obj_align(lbl, LV_ALIGN_LEFT_MID, 8, 0);
   }
@@ -727,8 +826,10 @@ static void performReconScan() {
   watchdog.start(wdTimeout);
   wdKick();
   lv_label_set_text_fmt(reconStatusLbl, LV_SYMBOL_OK "  Scan of %s complete -- %d/%d ports open",
-      targetIp, openCount, (int)NUM_COMMON_PORTS);
+      targetIp, openCount, reconPortCount);
   lv_obj_set_style_text_color(reconStatusLbl, lv_color_hex(C_TEXT), 0);
+  recordReconHistory(targetIp, openCount, reconPortCount);
+  updateReconHistoryLabel();
   DBG("recon: scan end");
 }
 
@@ -1478,11 +1579,22 @@ static void buildRecon(lv_obj_t *tab) {
   lv_obj_set_flex_flow(reconList, LV_FLEX_FLOW_COLUMN);
   lv_obj_set_style_pad_row(reconList, 6, 0);
 
+  /* Created once here, updated in place after every scan -- never a new
+   * widget per history entry, so this doesn't touch the LVGL pool the same
+   * way the (memory-expensive) result rows above do. */
+  lv_obj_t *histCard = makeCard(tab, 642, 60);
+  reconHistLbl = lv_label_create(histCard);
+  lv_obj_set_width(reconHistLbl, 610);
+  lv_label_set_long_mode(reconHistLbl, LV_LABEL_LONG_MODE_WRAP);
+  lv_label_set_text(reconHistLbl, "No scans yet this session");
+  lv_obj_add_style(reconHistLbl, &stMuted, 0);
+
   lv_obj_t *note = lv_label_create(tab);
   lv_label_set_text(note,
     "TCP connect-scan across common ports (FTP/SSH/Telnet/HTTP/HTTPS/SMB/RDP/\n"
-    "HTTP-alt). For authorized security testing only -- only scan hosts/networks\n"
-    "you have explicit permission to test.");
+    "HTTP-alt) or a custom comma-separated list you type after the IP\n"
+    "(e.g. \"192.168.1.1 22,80,8080\"), capped at 8. For authorized security\n"
+    "testing only -- only scan hosts/networks you have explicit permission to test.");
   lv_obj_add_style(note, &stMuted, 0);
 }
 
@@ -1658,7 +1770,14 @@ void loop() {
     }
     else if (cmd == 'i') openReconModal();       /* open the recon target-IP modal */
     else if (cmd == 'k') {                       /* submit a dummy target (RFC 5737 TEST-NET-1,
-                                                   * non-routable -- safe for automated testing) */
+                                                   * non-routable -- safe for automated testing) with
+                                                   * an explicit custom port list, exercising both the
+                                                   * new parsing path and the default-list fallback */
+      if (reconTa) lv_textarea_set_text(reconTa, "192.0.2.1 22,80,443");
+      if (reconKb) lv_obj_send_event(reconKb, LV_EVENT_READY, NULL);
+    }
+    else if (cmd == 'j') {                       /* same, but no ports typed -- tests the fallback
+                                                   * to the default COMMON_PORTS list */
       if (reconTa) lv_textarea_set_text(reconTa, "192.0.2.1");
       if (reconKb) lv_obj_send_event(reconKb, LV_EVENT_READY, NULL);
     }
